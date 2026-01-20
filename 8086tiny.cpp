@@ -11,6 +11,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <array>
+#include <cctype>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -477,9 +482,13 @@ char pc_interrupt(unsigned char interrupt_num);
 
 extern u8 mem[RAM_SIZE];
 extern u8 int8_asap;
+extern bool g_scripted_input;
 
 static inline int poll_console_keyboard()
 {
+	// In headless exploration runs with scripted input, never block on stdin.
+	if (g_scripted_input)
+		return 0;
 	return platform::poll_keyboard(mem, int8_asap, [](unsigned char n) { pc_interrupt(n); }) ? 1 : 0;
 }
 
@@ -562,6 +571,126 @@ static std::vector<DecisionPoint> g_decision_points;
 static const char *g_dump_instr_path = nullptr;
 static const char *g_dump_decisions_path = nullptr;
 static u32 g_max_instructions = 0; // 0 = unlimited
+
+bool g_scripted_input = false;
+std::vector<u16> g_scripted_keys;
+std::size_t g_scripted_key_pos = 0;
+
+static std::string trim(std::string s)
+{
+	const auto not_space = [](unsigned char c) { return !std::isspace(c); };
+	s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+	s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+	return s;
+}
+
+static std::string upper_ascii(std::string s)
+{
+	for (char &c : s)
+		c = (char)std::toupper((unsigned char)c);
+	return s;
+}
+
+static bool token_is_banned_gorilla_key(const std::string &tok_upper)
+{
+	// Hard bans (quit + emulator/UI hotkeys).
+	if (tok_upper == "N" || tok_upper == "QUIT")
+		return true;
+	if (tok_upper.find("ALT") != std::string::npos)
+		return true;
+	return false;
+}
+
+static bool try_parse_gorilla_ascii_token(const std::string &token, u8 &out_ascii)
+{
+	std::string tok = upper_ascii(trim(token));
+	if (tok.empty())
+		return false;
+
+	if (token_is_banned_gorilla_key(tok))
+		return false;
+
+	if (tok.size() == 1)
+	{
+		const char c = tok[0];
+		if (c >= '0' && c <= '9')
+		{
+			out_ascii = (u8)c;
+			return true;
+		}
+		if (c == 'Y')
+		{
+			out_ascii = (u8)'Y';
+			return true;
+		}
+		return false;
+	}
+
+	if (tok == "ENTER" || tok == "RETURN")
+	{
+		out_ascii = 0x0D;
+		return true;
+	}
+	if (tok == "BACKSPACE" || tok == "BS")
+	{
+		out_ascii = 0x08;
+		return true;
+	}
+	if (tok == "Y")
+	{
+		out_ascii = (u8)'Y';
+		return true;
+	}
+
+	return false;
+}
+
+static bool load_scripted_keys_from_stream(std::istream &in, std::vector<u16> &out_keys)
+{
+	std::string line;
+	while (std::getline(in, line))
+	{
+		line = trim(line);
+		if (line.empty() || line[0] == '#')
+			continue;
+
+		// Support comma-separated tokens per line.
+		std::stringstream ss(line);
+		std::string token;
+		while (std::getline(ss, token, ','))
+		{
+			u8 ascii = 0;
+			if (!try_parse_gorilla_ascii_token(token, ascii))
+				return false;
+			// Key word format matches SDL path: 0x0400 marks SDL-origin key, low byte is ASCII.
+			out_keys.push_back((u16)(0x0400u | (u16)ascii));
+		}
+	}
+	return true;
+}
+
+static bool load_scripted_keys_from_file(const char *path, std::vector<u16> &out_keys)
+{
+	std::ifstream f(path);
+	if (!f)
+		return false;
+	return load_scripted_keys_from_stream(f, out_keys);
+}
+
+static inline bool scripted_input_has_key() noexcept
+{
+	return g_scripted_input && g_scripted_key_pos < g_scripted_keys.size();
+}
+
+static inline u16 scripted_input_peek() noexcept
+{
+	return scripted_input_has_key() ? g_scripted_keys[g_scripted_key_pos] : 0;
+}
+
+static inline u16 scripted_input_pop() noexcept
+{
+	return scripted_input_has_key() ? g_scripted_keys[g_scripted_key_pos++] : 0;
+}
 
 static inline u32 phys20(u16 seg, u16 off) noexcept
 {
@@ -1072,6 +1201,62 @@ int main(int argc, char **argv)
 			g_max_instructions = (u32)std::strtoul(arg + 11, nullptr, 10);
 			continue;
 		}
+		if (!std::strcmp(arg, "--keys-file") && (i + 1) < argc)
+		{
+			const char *path = argv[++i];
+			std::vector<u16> tmp;
+			if (!load_scripted_keys_from_file(path, tmp))
+			{
+				std::fprintf(stderr, "Failed to load --keys-file (or banned/unknown token): %s\n", path);
+				return 2;
+			}
+			g_scripted_input = true;
+			g_scripted_keys = std::move(tmp);
+			g_scripted_key_pos = 0;
+			continue;
+		}
+		if (!std::strncmp(arg, "--keys-file=", 12))
+		{
+			const char *path = arg + 12;
+			std::vector<u16> tmp;
+			if (!load_scripted_keys_from_file(path, tmp))
+			{
+				std::fprintf(stderr, "Failed to load --keys-file (or banned/unknown token): %s\n", path);
+				return 2;
+			}
+			g_scripted_input = true;
+			g_scripted_keys = std::move(tmp);
+			g_scripted_key_pos = 0;
+			continue;
+		}
+		if (!std::strcmp(arg, "--keys") && (i + 1) < argc)
+		{
+			std::stringstream ss(argv[++i]);
+			std::vector<u16> tmp;
+			if (!load_scripted_keys_from_stream(ss, tmp))
+			{
+				std::fprintf(stderr, "Failed to parse --keys (banned/unknown token).\n");
+				return 2;
+			}
+			g_scripted_input = true;
+			g_scripted_keys = std::move(tmp);
+			g_scripted_key_pos = 0;
+			continue;
+		}
+		if (!std::strncmp(arg, "--keys=", 7))
+		{
+			std::stringstream ss(arg + 7);
+			std::vector<u16> tmp;
+			if (!load_scripted_keys_from_stream(ss, tmp))
+			{
+				std::fprintf(stderr, "Failed to parse --keys (banned/unknown token).\n");
+				return 2;
+			}
+			g_scripted_input = true;
+			g_scripted_keys = std::move(tmp);
+			g_scripted_key_pos = 0;
+			continue;
+		}
 
 		positional.push_back(arg);
 	}
@@ -1079,7 +1264,7 @@ int main(int argc, char **argv)
 	if (positional.size() < 2)
 	{
 		std::fprintf(stderr,
-			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] bios fd.img [hd.img]\n",
+			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...] bios fd.img [hd.img]\n",
 			argv[0]);
 		return 1;
 	}
@@ -1593,12 +1778,47 @@ int main(int argc, char **argv)
 				pc_interrupt(3);
 				break;
 			case OpcodeGroup::INT_IMM8:
-					if ((u8)i_data0 == 0x16)
+				if ((u8)i_data0 == 0x16)
+				{
+					const u8 ah = regs8[idx(Reg8::AH)];
+					if (ah == 0x00 || ah == 0x01)
+						g_decision_points.push_back(DecisionPoint{cur_inst, inst_cs, inst_ip, inst_phys, ah});
+
+					// Scripted input mode: emulate INT 16h directly for speed and determinism.
+					// Returns ASCII in AL, sets ZF for AH=01h, and avoids BIOS INT 7h buffer logic.
+					if (g_scripted_input && (ah == 0x00 || ah == 0x01))
 					{
-						const u8 ah = regs8[idx(Reg8::AH)];
-						if (ah == 0x00 || ah == 0x01)
-							g_decision_points.push_back(DecisionPoint{cur_inst, inst_cs, inst_ip, inst_phys, ah});
+						if (ah == 0x01)
+						{
+							if (!scripted_input_has_key())
+							{
+								regs8[idx(Flag::ZF)] = 1;
+								reg_ip += 2;
+								break;
+							}
+							const u16 kw = scripted_input_peek();
+							regs8[idx(Flag::ZF)] = 0;
+							regs8[idx(Reg8::AL)] = (u8)(kw & 0xFF);
+							regs8[idx(Reg8::AH)] = 0;
+							reg_ip += 2;
+							break;
+						}
+
+						// AH=00h: read key; if no key left, end run (avoid blocking forever).
+						if (!scripted_input_has_key())
+						{
+							regs16[idx(Reg16::CS)] = 0;
+							reg_ip = 0;
+							break;
+						}
+						const u16 kw = scripted_input_pop();
+						regs8[idx(Reg8::AL)] = (u8)(kw & 0xFF);
+						regs8[idx(Reg8::AH)] = 0;
+						reg_ip += 2;
+						break;
 					}
+				}
+
 				reg_ip += 2;
 				pc_interrupt(i_data0);
 				break;
