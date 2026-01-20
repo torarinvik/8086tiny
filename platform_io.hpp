@@ -60,6 +60,17 @@ namespace platform
 #endif
 	}
 
+	inline std::int64_t seek_set_bytes(int fd, std::uint64_t offset)
+	{
+#if defined(_WIN32)
+		const auto pos = _lseeki64(fd, (std::int64_t)offset, SEEK_SET);
+		return (std::int64_t)pos;
+#else
+		const auto pos = ::lseek(fd, (off_t)offset, SEEK_SET);
+		return (std::int64_t)pos;
+#endif
+	}
+
 	inline int open_disk_image(const char *path)
 	{
 #if defined(_WIN32)

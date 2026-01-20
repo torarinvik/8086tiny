@@ -45,6 +45,18 @@ constexpr std::size_t VIDEO_RAM_SIZE = 0x10000;
 constexpr u32 kGraphicsUpdateDelay = (u32)GRAPHICS_UPDATE_DELAY;
 constexpr u32 kKeyboardTimerUpdateDelay = 20000;
 
+#ifndef SNAP_AT
+#define SNAP_AT 0
+#endif
+
+#ifndef TRACE_FROM
+#define TRACE_FROM 0u
+#endif
+
+#ifndef TRACE_LEN
+#define TRACE_LEN 0u
+#endif
+
 template <typename E>
 constexpr std::underlying_type_t<E> to_underlying(E e) noexcept
 {
@@ -722,7 +734,11 @@ static int sdl_keyboard_driver()
 		if (!scratch_uint || scratch_uint > 0x7F)
 			scratch_uint = (unsigned int)sdl_event.key.keysym.sym;
 
-		ref<short>(mem[0x4A6]) = 0x400 + 0x800*!!(scratch2_uint & KMOD_ALT) + 0x1000*!!(scratch2_uint & KMOD_SHIFT) + 0x2000*!!(scratch2_uint & KMOD_CTRL) + 0x4000*(sdl_event.type == SDL_KEYUP) + scratch_uint;
+		// Match the original behavior: write a 16-bit key word to BDA 0x4A6 with modulo-16 truncation.
+		const u32 key_word = 0x400u + 0x800u * !!(scratch2_uint & KMOD_ALT)
+			+ 0x1000u * !!(scratch2_uint & KMOD_SHIFT) + 0x2000u * !!(scratch2_uint & KMOD_CTRL)
+			+ 0x4000u * (sdl_event.type == SDL_KEYUP) + (u32)scratch_uint;
+		ref<u16>(mem[0x4A6]) = (u16)key_word;
 		pc_interrupt(7);
 		return 1;
 	}
@@ -813,7 +829,8 @@ static inline int das() noexcept
 static inline int adc_op() noexcept
 {
 	OP(+= regs8[idx(Flag::CF)] +);
-	set_CF(regs8[idx(Flag::CF)] && (op_result == op_dest) || (op_result < (int)op_dest));
+	// Keep the original precedence: (oldCF && result==dest) || (result < (int)dest)
+	set_CF((regs8[idx(Flag::CF)] && (op_result == op_dest)) || (op_result < (int)op_dest));
 	set_AF_OF_arith();
 	return 0;
 }
@@ -821,7 +838,8 @@ static inline int adc_op() noexcept
 static inline int sbb_op() noexcept
 {
 	OP(-= regs8[idx(Flag::CF)] +);
-	set_CF(regs8[idx(Flag::CF)] && (op_result == op_dest) || (-op_result < -(int)op_dest));
+	// Keep the original precedence: (oldCF && result==dest) || (-result < -(int)dest)
+	set_CF((regs8[idx(Flag::CF)] && (op_result == op_dest)) || (-op_result < -(int)op_dest));
 	set_AF_OF_arith();
 	return 0;
 }
@@ -962,6 +980,37 @@ int main(int argc, char **argv)
 		i_data1 = ref<short>(opcode_stream[2]);
 		i_data2 = ref<short>(opcode_stream[3]);
 
+#if TRACE_LEN
+		{
+			const u32 cur_inst = inst_counter + 1u;
+			if (cur_inst >= (u32)TRACE_FROM && cur_inst < (u32)TRACE_FROM + (u32)TRACE_LEN)
+			{
+				// Format matches the historic trace files in this repo (trace_c.txt / trace_cpp.txt).
+				std::fprintf(stdout,
+					"T %u CS:IP=%04X:%04X op=%02X xlat=%u extra=%u w=%u d=%u modsz=%u AL=%02X AX=%04X IF=%u CF=%u ZF=%u SF=%u OF=%u\n",
+					(unsigned)cur_inst,
+					(unsigned)regs16[idx(Reg16::CS)],
+					(unsigned)reg_ip,
+					(unsigned)(unsigned char)*opcode_stream,
+					(unsigned)xlat_opcode_id,
+					(unsigned)extra,
+					(unsigned)i_w,
+					(unsigned)i_d,
+					(unsigned)i_mod_size,
+					(unsigned)regs8[idx(Reg8::AL)],
+					(unsigned)regs16[idx(Reg16::AX)],
+					(unsigned)regs8[idx(Flag::IF)],
+					(unsigned)regs8[idx(Flag::CF)],
+					(unsigned)regs8[idx(Flag::ZF)],
+					(unsigned)regs8[idx(Flag::SF)],
+					(unsigned)regs8[idx(Flag::OF)]);
+			}
+			// Stop once the trace window is complete to keep runs short and diff-friendly.
+			if (cur_inst >= (u32)TRACE_FROM + (u32)TRACE_LEN)
+				break;
+		}
+#endif
+
 		// seg_override_en and rep_override_en contain number of instructions to hold segment override and REP prefix respectively
 		if (seg_override_en)
 			seg_override_en--;
@@ -1024,7 +1073,7 @@ int main(int argc, char **argv)
 					R_M_OP(reg_ip, =, mem[op_from_addr]),
 					set_opcode(0x9A); // Decode like CALL
 				else // PUSH
-						r_m_push(mem[rm_addr]);
+						r_m_push(ref<unsigned short>(mem[rm_addr]));
 					break;
 				case OpcodeGroup::GRP_TEST_NOT_NEG_MUL_DIV:
 				op_to_addr = op_from_addr;
@@ -1405,21 +1454,49 @@ int main(int argc, char **argv)
 						platform::write_fd(1, regs8, 1);
 						break;
 					case EmulatorOp::GET_RTC:
+#ifdef DETERMINISTIC_RTC
+						// Use deterministic values that increment, for testing
+						{
+							static struct tm fixed_tm = {0, 0, 12, 15, 0, 125, 3, 14, 0};
+							static short fixed_ms = 0;
+							fixed_ms = (fixed_ms + 100) % 1000;  // Increment by 100ms each call
+							if (fixed_ms == 0) fixed_tm.tm_sec++;  // Increment seconds
+							memcpy(mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]), &fixed_tm, sizeof(struct tm));
+							ref<short>(mem[segreg(idx(Reg16::ES), (u16)(regs16[idx(Reg16::BX)] + 36))]) = fixed_ms;
+						}
+#else
 						time(&clock_buf);
 						ftime(&ms_clock);
 						memcpy(mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]), localtime(&clock_buf), sizeof(struct tm));
 						ref<short>(mem[segreg(idx(Reg16::ES), (u16)(regs16[idx(Reg16::BX)] + 36))]) = ms_clock.millitm;
+#endif
 						break;
 					case EmulatorOp::DISK_READ:
 					case EmulatorOp::DISK_WRITE:
 					{
-						int fd = disk[regs8[idx(Reg8::DL)]];
-						unsigned int lba_offset = (unsigned int)regs16[idx(Reg16::BP)] << 9;
-						unsigned int byte_count = regs16[idx(Reg16::AX)];
+						const int fd = disk[regs8[idx(Reg8::DL)]];
+						const unsigned int byte_count = regs16[idx(Reg16::AX)];
 						u8 *buf = mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]);
 						const bool is_write = ((char)i_data0 == 3);
-						const std::int64_t rv = platform::rw_at_offset(fd, buf, (std::size_t)byte_count, (std::uint64_t)lba_offset, is_write);
-						regs8[idx(Reg8::AL)] = (rv < 0) ? 0 : (u8)rv;
+
+						// Match original C semantics:
+						// - offset uses a 32-bit sector index sourced from SI:BP
+						// - seek failure returns AL=0
+						// - read/write failure returns AL=0xFF (via u8 cast of -1)
+						const u32 lba = ref<u32>(regs8[2u * idx(Reg16::BP)]);
+						const std::uint64_t byte_offset = (std::uint64_t)lba << 9;
+						const std::int64_t pos = platform::seek_set_bytes(fd, byte_offset);
+						if (pos == (std::int64_t)-1)
+						{
+							regs8[idx(Reg8::AL)] = 0;
+						}
+						else
+						{
+							const std::int64_t rv = is_write
+								? platform::write_fd(fd, buf, (std::size_t)byte_count)
+								: platform::read_fd(fd, buf, (std::size_t)byte_count);
+							regs8[idx(Reg8::AL)] = (u8)rv;
+						}
 					}
 						break;
 					default:
@@ -1449,6 +1526,28 @@ int main(int argc, char **argv)
 		// Poll timer/keyboard every kKeyboardTimerUpdateDelay instructions
 		if (!(++inst_counter % kKeyboardTimerUpdateDelay))
 			int8_asap = 1;
+
+#if SNAP_AT
+		if (inst_counter == (u32)SNAP_AT)
+		{
+			std::fprintf(stderr,
+				"SNAP_AT=%u CS:IP=%04X:%04X raw=%02X xlat=%u extra=%u w=%u d=%u IF=%u TF=%u seg_ovr=%u rep_ovr=%u int8=%u\n",
+				(unsigned)inst_counter,
+				(unsigned)regs16[idx(Reg16::CS)],
+				(unsigned)reg_ip,
+				(unsigned)raw_opcode_id,
+				(unsigned)xlat_opcode_id,
+				(unsigned)extra,
+				(unsigned)i_w,
+				(unsigned)i_d,
+				(unsigned)regs8[idx(Flag::IF)],
+				(unsigned)regs8[idx(Flag::TF)],
+				(unsigned)seg_override_en,
+				(unsigned)rep_override_en,
+				(unsigned)int8_asap);
+			break;
+		}
+#endif
 
 #ifndef NO_GRAPHICS
 		// Update the video graphics display every kGraphicsUpdateDelay instructions

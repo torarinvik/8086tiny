@@ -1,4 +1,37 @@
-8086tiny
-8086tiny
+/.DS_Store
+
+# Build outputs / binaries
+/8086tiny
+/8086tiny_c
+/8086tiny_cpp
+/8086tiny_c_trace
+/8086tiny_cpp_trace
+
+# Generated experiment builds (untracked)
+/8086tiny_c_det
+/8086tiny_c_early
+/8086tiny_c_mid
+/8086tiny_c_test
+/8086tiny_c_if
+/8086tiny_c_snap
+
+/8086tiny_cpp_det
+/8086tiny_cpp_early
+/8086tiny_cpp_mid
+/8086tiny_cpp_test
+/8086tiny_cpp_if
+/8086tiny_cpp_snap
+
+# Local traces
+/trace_new_*.txt
+
+# Common build byproducts
+*.o
+*.obj
+*.dSYM/
+
+# Generated logs/dumps in this repo
+*.txt
 Original_version.c
-8086tiny
+VERIFY_YOUR_REASONING.py
+8086tiny_cpp
