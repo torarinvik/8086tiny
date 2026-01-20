@@ -8,7 +8,9 @@
 #include <ctime>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
 #include <vector>
 #include <sys/timeb.h>
@@ -23,6 +25,19 @@ using s32 = std::int32_t;
 #include <fcntl.h>
 #endif
 
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#define OPEN_DISK_FLAGS (O_BINARY | O_LARGEFILE | O_CLOEXEC | O_RDWR)
+#define OPEN_DISK_FLAGS_FALLBACK (O_BINARY | O_LARGEFILE | O_CLOEXEC | O_RDONLY)
+
 #ifndef NO_GRAPHICS
 #if __has_include(<SDL2/SDL.h>)
 #include <SDL2/SDL.h>
@@ -32,74 +47,75 @@ using s32 = std::int32_t;
 #endif
 
 // Emulator system constants
-#define IO_PORT_COUNT 0x10000
-#define RAM_SIZE 0x10FFF0
-#define REGS_BASE 0xF0000
-#define VIDEO_RAM_SIZE 0x10000
+constexpr std::size_t IO_PORT_COUNT = 0x10000;
+constexpr std::size_t RAM_SIZE = 0x10FFF0;
+constexpr std::size_t REGS_BASE = 0xF0000;
+constexpr std::size_t VIDEO_RAM_SIZE = 0x10000;
 
 // Graphics/timer/keyboard update delays (explained later)
 #ifndef GRAPHICS_UPDATE_DELAY
 #define GRAPHICS_UPDATE_DELAY 360000
 #endif
-#define KEYBOARD_TIMER_UPDATE_DELAY 20000
+constexpr u32 kGraphicsUpdateDelay = (u32)GRAPHICS_UPDATE_DELAY;
+constexpr u32 kKeyboardTimerUpdateDelay = 20000;
 
 // 16-bit register decodes
-#define REG_AX 0
-#define REG_CX 1
-#define REG_DX 2
-#define REG_BX 3
-#define REG_SP 4
-#define REG_BP 5
-#define REG_SI 6
-#define REG_DI 7
+constexpr int REG_AX = 0;
+constexpr int REG_CX = 1;
+constexpr int REG_DX = 2;
+constexpr int REG_BX = 3;
+constexpr int REG_SP = 4;
+constexpr int REG_BP = 5;
+constexpr int REG_SI = 6;
+constexpr int REG_DI = 7;
 
-#define REG_ES 8
-#define REG_CS 9
-#define REG_SS 10
-#define REG_DS 11
+constexpr int REG_ES = 8;
+constexpr int REG_CS = 9;
+constexpr int REG_SS = 10;
+constexpr int REG_DS = 11;
 
-#define REG_ZERO 12
-#define REG_SCRATCH 13
+constexpr int REG_ZERO = 12;
+constexpr int REG_SCRATCH = 13;
 
 // 8-bit register decodes
-#define REG_AL 0
-#define REG_AH 1
-#define REG_CL 2
-#define REG_CH 3
-#define REG_DL 4
-#define REG_DH 5
-#define REG_BL 6
-#define REG_BH 7
+constexpr int REG_AL = 0;
+constexpr int REG_AH = 1;
+constexpr int REG_CL = 2;
+constexpr int REG_CH = 3;
+constexpr int REG_DL = 4;
+constexpr int REG_DH = 5;
+constexpr int REG_BL = 6;
+constexpr int REG_BH = 7;
 
 // FLAGS register decodes
-#define FLAG_CF 40
-#define FLAG_PF 41
-#define FLAG_AF 42
-#define FLAG_ZF 43
-#define FLAG_SF 44
-#define FLAG_TF 45
-#define FLAG_IF 46
-#define FLAG_DF 47
-#define FLAG_OF 48
+constexpr int FLAG_CF = 40;
+constexpr int FLAG_PF = 41;
+constexpr int FLAG_AF = 42;
+constexpr int FLAG_ZF = 43;
+constexpr int FLAG_SF = 44;
+constexpr int FLAG_TF = 45;
+constexpr int FLAG_IF = 46;
+constexpr int FLAG_DF = 47;
+constexpr int FLAG_OF = 48;
 
 // Lookup tables in the BIOS binary
-#define TABLE_XLAT_OPCODE 8
-#define TABLE_XLAT_SUBFUNCTION 9
-#define TABLE_STD_FLAGS 10
-#define TABLE_PARITY_FLAG 11
-#define TABLE_BASE_INST_SIZE 12
-#define TABLE_I_W_SIZE 13
-#define TABLE_I_MOD_SIZE 14
-#define TABLE_COND_JUMP_DECODE_A 15
-#define TABLE_COND_JUMP_DECODE_B 16
-#define TABLE_COND_JUMP_DECODE_C 17
-#define TABLE_COND_JUMP_DECODE_D 18
-#define TABLE_FLAGS_BITFIELDS 19
+constexpr int TABLE_XLAT_OPCODE = 8;
+constexpr int TABLE_XLAT_SUBFUNCTION = 9;
+constexpr int TABLE_STD_FLAGS = 10;
+constexpr int TABLE_PARITY_FLAG = 11;
+constexpr int TABLE_BASE_INST_SIZE = 12;
+constexpr int TABLE_I_W_SIZE = 13;
+constexpr int TABLE_I_MOD_SIZE = 14;
+constexpr int TABLE_COND_JUMP_DECODE_A = 15;
+constexpr int TABLE_COND_JUMP_DECODE_B = 16;
+constexpr int TABLE_COND_JUMP_DECODE_C = 17;
+constexpr int TABLE_COND_JUMP_DECODE_D = 18;
+constexpr int TABLE_FLAGS_BITFIELDS = 19;
 
 // Bitfields for TABLE_STD_FLAGS values
-#define FLAGS_UPDATE_SZP 1
-#define FLAGS_UPDATE_AO_ARITH 2
-#define FLAGS_UPDATE_OC_LOGIC 4
+constexpr u32 FLAGS_UPDATE_SZP = 1;
+constexpr u32 FLAGS_UPDATE_AO_ARITH = 2;
+constexpr u32 FLAGS_UPDATE_OC_LOGIC = 4;
 
 // Helper macros
 
@@ -311,9 +327,34 @@ struct timeb ms_clock;
 #ifndef NO_GRAPHICS
 SDL_AudioSpec sdl_audio;
 SDL_AudioDeviceID sdl_audio_dev;
-SDL_Window *sdl_window;
-SDL_Renderer *sdl_renderer;
-SDL_Texture *sdl_texture;
+struct SdlWindowDeleter
+{
+	void operator()(SDL_Window *p) const noexcept
+	{
+		if (p)
+			SDL_DestroyWindow(p);
+	}
+};
+struct SdlRendererDeleter
+{
+	void operator()(SDL_Renderer *p) const noexcept
+	{
+		if (p)
+			SDL_DestroyRenderer(p);
+	}
+};
+struct SdlTextureDeleter
+{
+	void operator()(SDL_Texture *p) const noexcept
+	{
+		if (p)
+			SDL_DestroyTexture(p);
+	}
+};
+
+std::unique_ptr<SDL_Window, SdlWindowDeleter> sdl_window;
+std::unique_ptr<SDL_Renderer, SdlRendererDeleter> sdl_renderer;
+std::unique_ptr<SDL_Texture, SdlTextureDeleter> sdl_texture;
 std::vector<std::uint32_t> sdl_pixels;
 SDL_Event sdl_event;
 u16 vid_addr_lookup[VIDEO_RAM_SIZE], cga_colors[4] = {0 /* Black */, 0x1F1F /* Cyan */, 0xE3E3 /* Magenta */, 0xFFFF /* White */};
@@ -447,10 +488,16 @@ int main(int argc, char **argv)
 	if (sdl_audio_dev)
 		SDL_PauseAudioDevice(sdl_audio_dev, 0);
 
-	sdl_window = nullptr;
-	sdl_renderer = nullptr;
-	sdl_texture = nullptr;
+	sdl_window.reset();
+	sdl_renderer.reset();
+	sdl_texture.reset();
 #endif
+
+	if (argc < 3)
+	{
+		std::fprintf(stderr, "Usage: %s bios fd.img [hd.img]\n", argv[0]);
+		return 1;
+	}
 
 	// regs16 and reg8 point to F000:0, the start of memory-mapped registers. CS is initialised to F000
 	regs8 = mem + REGS_BASE;
@@ -466,7 +513,19 @@ int main(int argc, char **argv)
 
 	// Open BIOS (file id disk[2]), floppy disk image (disk[1]), and hard disk image (disk[0]) if specified
 	for (file_index = 3; file_index;)
-		disk[--file_index] = *++argv ? open(*argv, 32898) : 0;
+	{
+		const char *path = *++argv;
+		if (!path)
+		{
+			disk[--file_index] = 0;
+			continue;
+		}
+
+		int fd = open(path, OPEN_DISK_FLAGS);
+		if (fd < 0)
+			fd = open(path, OPEN_DISK_FLAGS_FALLBACK);
+		disk[--file_index] = (fd < 0) ? 0 : fd;
+	}
 
 	// Set CX:AX equal to the hard disk image size, if present
 	REF(unsigned, regs16[REG_AX]) = *disk ? lseek(*disk, 0, 2) >> 9 : 0;
@@ -904,19 +963,19 @@ int main(int argc, char **argv)
 				set_CF(0), set_OF(0);
 		}
 
-		// Poll timer/keyboard every KEYBOARD_TIMER_UPDATE_DELAY instructions
-		if (!(++inst_counter % KEYBOARD_TIMER_UPDATE_DELAY))
+		// Poll timer/keyboard every kKeyboardTimerUpdateDelay instructions
+		if (!(++inst_counter % kKeyboardTimerUpdateDelay))
 			int8_asap = 1;
 
 #ifndef NO_GRAPHICS
-		// Update the video graphics display every GRAPHICS_UPDATE_DELAY instructions
-		if (!(inst_counter % GRAPHICS_UPDATE_DELAY))
+		// Update the video graphics display every kGraphicsUpdateDelay instructions
+		if (!(inst_counter % kGraphicsUpdateDelay))
 		{
 			// Video card in graphics mode?
 			if (io_ports[0x3B8] & 2)
 			{
 				// If we don't already have an SDL window open, set it up and compute color and video memory translation tables
-					if (!sdl_window)
+						if (!sdl_window)
 				{
 					for (int i = 0; i < 16; i++)
 						pixel_colors[i] = mem[0x4AC] ? // CGA?
@@ -926,37 +985,32 @@ int main(int argc, char **argv)
 					for (int i = 0; i < GRAPHICS_X * GRAPHICS_Y / 4; i++)
 						vid_addr_lookup[i] = i / GRAPHICS_X * (GRAPHICS_X / 8) + (i / 2) % (GRAPHICS_X / 8) + 0x2000*(mem[0x4AC] ? (2 * i / GRAPHICS_X) % 2 : (4 * i / GRAPHICS_X) % 4);
 
-						sdl_window = SDL_CreateWindow("8086tiny", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, GRAPHICS_X, GRAPHICS_Y, 0);
-						sdl_renderer = sdl_window ? SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED) : nullptr;
-						sdl_texture = sdl_renderer ? SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_RGB332, SDL_TEXTUREACCESS_STREAMING, GRAPHICS_X, GRAPHICS_Y) : nullptr;
-						sdl_pixels.assign((size_t)GRAPHICS_X * (size_t)GRAPHICS_Y / 4u, 0u);
+							sdl_window.reset(SDL_CreateWindow("8086tiny", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, GRAPHICS_X, GRAPHICS_Y, 0));
+							sdl_renderer.reset(sdl_window ? SDL_CreateRenderer(sdl_window.get(), -1, SDL_RENDERER_ACCELERATED) : nullptr);
+							sdl_texture.reset(sdl_renderer ? SDL_CreateTexture(sdl_renderer.get(), SDL_PIXELFORMAT_RGB332, SDL_TEXTUREACCESS_STREAMING, GRAPHICS_X, GRAPHICS_Y) : nullptr);
+							sdl_pixels.assign((size_t)GRAPHICS_X * (size_t)GRAPHICS_Y / 4u, 0u);
 				}
 
 				// Refresh SDL display from emulated graphics card video RAM
 				vid_mem_base = mem + 0xB0000 + 0x8000*(mem[0x4AC] ? 1 : io_ports[0x3B8] >> 7); // B800:0 for CGA/Hercules bank 2, B000:0 for Hercules bank 1
-					if (sdl_texture && !sdl_pixels.empty())
+						if (sdl_texture && !sdl_pixels.empty())
 				{
 						auto *dst = sdl_pixels.data();
-					for (int i = 0; i < GRAPHICS_X * GRAPHICS_Y / 4; i++)
+							const int quad_count = GRAPHICS_X * GRAPHICS_Y / 4;
+							for (int i = 0; i < quad_count; i++)
 						dst[i] = pixel_colors[15 & (vid_mem_base[vid_addr_lookup[i]] >> 4*!(i & 1))];
 
-					SDL_UpdateTexture(sdl_texture, nullptr, sdl_pixels.data(), GRAPHICS_X);
-					SDL_RenderClear(sdl_renderer);
-					SDL_RenderCopy(sdl_renderer, sdl_texture, nullptr, nullptr);
-					SDL_RenderPresent(sdl_renderer);
+							SDL_UpdateTexture(sdl_texture.get(), nullptr, sdl_pixels.data(), GRAPHICS_X);
+							SDL_RenderClear(sdl_renderer.get());
+							SDL_RenderCopy(sdl_renderer.get(), sdl_texture.get(), nullptr, nullptr);
+							SDL_RenderPresent(sdl_renderer.get());
 				}
 			}
 			else if (sdl_window) // Application has gone back to text mode, so close the SDL window
 			{
-				if (sdl_texture)
-					SDL_DestroyTexture(sdl_texture);
-				if (sdl_renderer)
-					SDL_DestroyRenderer(sdl_renderer);
-				if (sdl_window)
-					SDL_DestroyWindow(sdl_window);
-					sdl_texture = nullptr;
-					sdl_renderer = nullptr;
-					sdl_window = nullptr;
+						sdl_texture.reset();
+						sdl_renderer.reset();
+						sdl_window.reset();
 				sdl_pixels.clear();
 			}
 			SDL_PumpEvents();
@@ -978,13 +1032,14 @@ int main(int argc, char **argv)
 #ifndef NO_GRAPHICS
 	if (sdl_audio_dev)
 		SDL_CloseAudioDevice(sdl_audio_dev);
-	if (sdl_texture)
-		SDL_DestroyTexture(sdl_texture);
-	if (sdl_renderer)
-		SDL_DestroyRenderer(sdl_renderer);
-	if (sdl_window)
-		SDL_DestroyWindow(sdl_window);
+	sdl_texture.reset();
+	sdl_renderer.reset();
+	sdl_window.reset();
 	SDL_Quit();
 #endif
+
+	for (int i = 0; i < 3; ++i)
+		if (disk[i] > 0)
+			close(disk[i]);
 	return 0;
 }
