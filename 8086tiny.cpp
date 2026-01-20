@@ -585,6 +585,13 @@ static u32 g_explore_seed = 1;
 static u32 g_explore_max_keys = 64;
 static u32 g_explore_corpus_max = 256;
 
+static bool g_quiet_output = false;
+static bool g_quiet_output_user_set = false;
+static bool g_explore_warmup_active = false;
+static bool g_explore_stop_requested = false;
+static u32 g_explore_warmup_inst = 2000000; // run this many instructions to reach DOS prompt before snapshotting
+static std::string g_explore_tty_tail;
+
 bool g_scripted_input = false;
 std::vector<u16> g_scripted_keys;
 std::size_t g_scripted_key_pos = 0;
@@ -656,6 +663,27 @@ static bool try_parse_gorilla_ascii_token(const std::string &token, u8 &out_asci
 	}
 
 	return false;
+}
+
+static inline void explore_observe_tty_char(u8 ch)
+{
+	if (!g_explore_mode || !g_explore_warmup_active)
+		return;
+	if (!ch)
+		return;
+	g_explore_tty_tail.push_back((char)ch);
+	if (g_explore_tty_tail.size() > 512u)
+		g_explore_tty_tail.erase(0, g_explore_tty_tail.size() - 256u);
+
+	// Heuristic: prompt often contains something like "C:\\...>".
+	if (ch == (u8)'>')
+	{
+		const std::size_t n = g_explore_tty_tail.size();
+		const std::size_t start = (n > 64u) ? (n - 64u) : 0u;
+		const std::string_view tail(g_explore_tty_tail.data() + start, n - start);
+		if (tail.find(":\\") != std::string_view::npos)
+			g_explore_stop_requested = true;
+	}
 }
 
 static bool load_scripted_keys_from_stream(std::istream &in, std::vector<u16> &out_keys)
@@ -1359,6 +1387,18 @@ int main(int argc, char **argv)
 			g_explore_mode = true;
 			continue;
 		}
+		if (!std::strcmp(arg, "--quiet"))
+		{
+			g_quiet_output = true;
+			g_quiet_output_user_set = true;
+			continue;
+		}
+		if (!std::strcmp(arg, "--loud"))
+		{
+			g_quiet_output = false;
+			g_quiet_output_user_set = true;
+			continue;
+		}
 		if (!std::strcmp(arg, "--explore-iters") && (i + 1) < argc)
 		{
 			g_explore_iters = (u32)std::strtoul(argv[++i], nullptr, 10);
@@ -1397,6 +1437,16 @@ int main(int argc, char **argv)
 		if (!std::strncmp(arg, "--explore-corpus=", 17))
 		{
 			g_explore_corpus_max = (u32)std::strtoul(arg + 17, nullptr, 10);
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-warmup-inst") && (i + 1) < argc)
+		{
+			g_explore_warmup_inst = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-warmup-inst=", 22))
+		{
+			g_explore_warmup_inst = (u32)std::strtoul(arg + 22, nullptr, 10);
 			continue;
 		}
 		if (!std::strcmp(arg, "--keys-file") && (i + 1) < argc)
@@ -1466,13 +1516,17 @@ int main(int argc, char **argv)
 			g_dump_instr_path = "instr.csv";
 		if (!g_dump_decisions_path)
 			g_dump_decisions_path = "decisions.csv";
+		// Exploration is headless/high-volume; suppress BIOS PUTCHAR output unless the user opted in.
+		if (!g_quiet_output_user_set)
+			g_quiet_output = true;
 	}
 
 	if (positional.size() < 2)
 	{
 		std::fprintf(stderr,
 			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
-			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N]\n"
+			"          [--quiet|--loud]\n"
+			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N --explore-warmup-inst N]\n"
 			"          bios fd.img [hd.img]\n",
 			argv[0]);
 		return 1;
@@ -1536,6 +1590,8 @@ int main(int argc, char **argv)
 	std::vector<std::vector<u8>> explore_corpus;
 	std::vector<u8> explore_alphabet;
 	std::vector<u8> explore_current;
+	std::vector<u8> explore_user_seed_ascii;
+	u32 explore_saved_max_inst = 0;
 	u32 explore_iter = 0;
 	u32 explore_best_gain = 0;
 	std::vector<u8> explore_best_seq;
@@ -1551,26 +1607,26 @@ int main(int argc, char **argv)
 		explore_rng.seed(g_explore_seed);
 		explore_alphabet = default_explore_alphabet();
 
-		// Seed: try to launch Gorilla from the DOS prompt.
-		explore_corpus.push_back(std::vector<u8>{'G','O','R','I','L','L','A',0x0D});
-
-		// If the user provided --keys/--keys-file, treat it as an additional seed.
+		// Preserve any user-provided key seed, then run a warmup boot to reach the DOS prompt.
 		if (g_scripted_input && !g_scripted_keys.empty())
 		{
-			std::vector<u8> seed_ascii;
-			seed_ascii.reserve(g_scripted_keys.size());
+			explore_user_seed_ascii.reserve(g_scripted_keys.size());
 			for (u16 kw : g_scripted_keys)
-				seed_ascii.push_back((u8)(kw & 0xFF));
-			explore_corpus.push_back(std::move(seed_ascii));
+				explore_user_seed_ascii.push_back((u8)(kw & 0xFF));
 		}
 
-		base_snapshot = make_snapshot();
+		explore_saved_max_inst = g_max_instructions;
+		if (!g_max_instructions || g_max_instructions < g_explore_warmup_inst)
+			g_max_instructions = g_explore_warmup_inst;
 
-		explore_current = explore_corpus.front();
-		g_scripted_input = true;
-		g_scripted_keys = make_key_words_from_ascii(explore_current);
-		g_scripted_key_pos = 0;
+		g_explore_warmup_active = true;
+		g_explore_tty_tail.clear();
 		g_last_run_gain = 0;
+
+		// Empty scripted input to keep warmup deterministic and non-blocking.
+		g_scripted_input = true;
+		g_scripted_keys.clear();
+		g_scripted_key_pos = 0;
 	}
 
 	run_loop:
@@ -2065,6 +2121,16 @@ int main(int argc, char **argv)
 						// AH=00h: read key; if no key left, end run (avoid blocking forever).
 						if (!scripted_input_has_key())
 						{
+							if (g_explore_mode && g_explore_warmup_active)
+							{
+								// Warmup: stop so we can snapshot at the prompt instead of terminating the VM.
+								g_explore_stop_requested = true;
+								regs8[idx(Reg8::AL)] = 0;
+								regs8[idx(Reg8::AH)] = 0;
+								reg_ip += 2;
+								break;
+							}
+							// Explore iterations: end run (avoid blocking forever).
 							regs16[idx(Reg16::CS)] = 0;
 							reg_ip = 0;
 							break;
@@ -2114,7 +2180,13 @@ int main(int argc, char **argv)
 				switch (static_cast<EmulatorOp>((char)i_data0))
 				{
 					case EmulatorOp::PUTCHAR_AL:
-						platform::write_fd(1, regs8, 1);
+					{
+						const u8 ch = regs8[idx(Reg8::AL)];
+						explore_observe_tty_char(ch);
+						if (!g_quiet_output)
+							platform::write_fd(1, &ch, 1);
+						break;
+					}
 						break;
 					case EmulatorOp::GET_RTC:
 #ifdef DETERMINISTIC_RTC
@@ -2192,6 +2264,12 @@ int main(int argc, char **argv)
 
 		if (g_max_instructions && inst_counter >= g_max_instructions)
 			break;
+
+		if (g_explore_stop_requested)
+		{
+			g_explore_stop_requested = false;
+			break;
+		}
 
 #if SNAP_AT
 		if (inst_counter == (u32)SNAP_AT)
@@ -2279,6 +2357,41 @@ int main(int argc, char **argv)
 
 	if (g_explore_mode)
 	{
+		if (g_explore_warmup_active)
+		{
+			// Warmup just ended: snapshot state (ideally at DOS prompt), then reset instrumentation
+			// so exploration measures only from the prompt onward.
+			g_explore_warmup_active = false;
+			g_explore_tty_tail.clear();
+			base_snapshot = make_snapshot();
+
+			std::fill(g_global_coverage.begin(), g_global_coverage.end(), 0);
+			std::fill(g_run_coverage.begin(), g_run_coverage.end(), 0);
+			g_run_touched.clear();
+			g_last_run_gain = 0;
+			g_decision_points.clear();
+			if (!g_instr_map.empty())
+				g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
+
+			explore_corpus.clear();
+			// Seed: try to launch Gorilla from the DOS prompt.
+			explore_corpus.push_back(std::vector<u8>{'G','O','R','I','L','L','A',0x0D});
+			if (!explore_user_seed_ascii.empty())
+				explore_corpus.push_back(explore_user_seed_ascii);
+
+			explore_iter = 0;
+			explore_best_gain = 0;
+			explore_best_seq.clear();
+
+			g_max_instructions = explore_saved_max_inst;
+			restore_snapshot(base_snapshot);
+			explore_current = explore_corpus.front();
+			g_scripted_input = true;
+			g_scripted_keys = make_key_words_from_ascii(explore_current);
+			g_scripted_key_pos = 0;
+			goto run_loop;
+		}
+
 		const u32 gain = g_last_run_gain;
 		finalize_run_coverage();
 

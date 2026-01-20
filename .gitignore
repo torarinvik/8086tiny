@@ -36,3 +36,4 @@ Original_version.c
 VERIFY_YOUR_REASONING.py
 8086tiny_cpp
 *.csv
+.~lock.decisions.csv\#
