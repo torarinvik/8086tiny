@@ -592,7 +592,8 @@ static u32 g_debug_diskio_left = 0;
 static bool g_explore_warmup_active = false;
 static bool g_explore_stop_requested = false;
 static bool g_explore_prompt_seen = false;
-static u32 g_explore_warmup_inst = 2000000; // run this many instructions to reach DOS prompt before snapshotting
+static u32 g_explore_warmup_inst = 2000000; // initial warmup budget; may auto-extend unless explicitly set
+static bool g_explore_warmup_inst_user_set = false;
 static std::string g_explore_tty_tail;
 
 bool g_scripted_input = false;
@@ -683,16 +684,34 @@ static inline void explore_observe_tty_char(u8 ch)
 	if (g_explore_tty_tail.size() > 512u)
 		g_explore_tty_tail.erase(0, g_explore_tty_tail.size() - 256u);
 
-	// Heuristic: prompt often contains something like "C:\\...>".
+	// Heuristic: prompt often contains something like "C:\\...>" or "A:>".
 	if (ch == (u8)'>')
 	{
 		const std::size_t n = g_explore_tty_tail.size();
-		const std::size_t start = (n > 64u) ? (n - 64u) : 0u;
-		const std::string_view tail(g_explore_tty_tail.data() + start, n - start);
-		if (tail.find(":\\") != std::string_view::npos)
+		if (n >= 4)
 		{
-			g_explore_prompt_seen = true;
-			g_explore_stop_requested = true;
+			const char a = g_explore_tty_tail[n - 4];
+			const char b = g_explore_tty_tail[n - 3];
+			const char c = g_explore_tty_tail[n - 2];
+			// Matches "C:\\>"
+			if (std::isalpha((unsigned char)a) && b == ':' && c == '\\')
+			{
+				g_explore_prompt_seen = true;
+				g_explore_stop_requested = true;
+				return;
+			}
+		}
+		if (n >= 3)
+		{
+			const char a = g_explore_tty_tail[n - 3];
+			const char b = g_explore_tty_tail[n - 2];
+			// Matches "A:>" (some shells / minimal prompts)
+			if (std::isalpha((unsigned char)a) && b == ':')
+			{
+				g_explore_prompt_seen = true;
+				g_explore_stop_requested = true;
+				return;
+			}
 		}
 	}
 }
@@ -1499,12 +1518,14 @@ int main(int argc, char **argv)
 		{
 			if (!parse_u32_flag("--explore-warmup-inst", argv[++i], g_explore_warmup_inst))
 				return 2;
+			g_explore_warmup_inst_user_set = true;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-warmup-inst=", 22))
 		{
 			if (!parse_u32_flag("--explore-warmup-inst", arg + 22, g_explore_warmup_inst))
 				return 2;
+			g_explore_warmup_inst_user_set = true;
 			continue;
 		}
 		if (!std::strcmp(arg, "--keys-file") && (i + 1) < argc)
@@ -1671,6 +1692,7 @@ int main(int argc, char **argv)
 	std::vector<u8> explore_current;
 	std::vector<u8> explore_user_seed_ascii;
 	u32 explore_saved_max_inst = 0;
+	u32 explore_warmup_ext_left = 4;
 	u32 explore_iter = 0;
 	u32 explore_best_gain = 0;
 	std::vector<u8> explore_best_seq;
@@ -2204,6 +2226,8 @@ int main(int argc, char **argv)
 							if (g_explore_mode)
 							{
 								// Exploration: stop the host run without mutating guest state.
+								if (g_explore_warmup_active)
+									g_explore_prompt_seen = true;
 								g_explore_stop_requested = true;
 								break;
 							}
@@ -2471,6 +2495,21 @@ int main(int argc, char **argv)
 	{
 		if (g_explore_warmup_active)
 		{
+			// If we hit the warmup instruction budget without seeing a prompt, auto-extend a few times
+			// (unless the user explicitly set --explore-warmup-inst).
+			if (!g_explore_prompt_seen && !g_explore_warmup_inst_user_set && g_max_instructions && inst_counter >= g_max_instructions && explore_warmup_ext_left)
+			{
+				--explore_warmup_ext_left;
+				const u32 prev = g_max_instructions;
+				const u32 next = (prev < 50000000u) ? (prev * 2u) : 50000000u;
+				if (next > prev)
+				{
+					g_max_instructions = next;
+					std::fprintf(stderr, "Explore warmup: extending budget to %u instructions (boot not ready yet).\n", (unsigned)g_max_instructions);
+					goto run_loop;
+				}
+			}
+
 			// Warmup just ended: snapshot state (ideally at DOS prompt), then reset instrumentation
 			// so exploration measures only from the prompt onward.
 			g_explore_warmup_active = false;
