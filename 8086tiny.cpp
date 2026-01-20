@@ -52,6 +52,7 @@ constexpr std::size_t PHYS_MEM_SIZE = 0x100000; // 20-bit, 1MB physical address 
 #endif
 constexpr u32 kGraphicsUpdateDelay = (u32)GRAPHICS_UPDATE_DELAY;
 constexpr u32 kKeyboardTimerUpdateDelay = 20000;
+constexpr u32 kExploreWarmupKeyboardTimerUpdateDelay = 2000;
 
 #ifndef SNAP_AT
 #define SNAP_AT 0
@@ -589,6 +590,20 @@ static bool g_quiet_output = false;
 static bool g_quiet_output_user_set = false;
 static bool g_debug_diskio = false;
 static u32 g_debug_diskio_left = 0;
+static bool g_scripted_input_user_set = false;
+
+// Diagnostics/progress
+static u32 g_progress_every_inst = 0; // 0 disables periodic progress
+static u32 g_tty_limit_bytes = 0;     // 0 = unlimited; applies when not quiet
+static std::uint64_t g_tty_bytes_written = 0;
+static bool g_tty_limit_tripped = false;
+static std::uint64_t g_disk_reads = 0;
+static std::uint64_t g_disk_writes = 0;
+static u32 g_last_diskio_inst = 0;
+static u16 g_progress_last_cs = 0xFFFFu;
+static u16 g_progress_last_ip = 0xFFFFu;
+static u32 g_progress_same_csip = 0;
+static bool g_progress_stuck_dumped = false;
 static bool g_explore_warmup_active = false;
 static bool g_explore_stop_requested = false;
 static bool g_explore_prompt_seen = false;
@@ -602,6 +617,42 @@ static u32 g_explore_dump_every = 0;   // iterations; 0 disables periodic dump
 
 static const char *g_run_exe_host_path = nullptr;
 static std::string g_fd_prepared_path;
+static bool g_audio_enabled = true;
+static bool g_audio_user_set = false;
+
+static void preparse_early_audio_flags(int argc, char **argv)
+{
+	bool want_audio = false;
+	bool want_no_audio = false;
+	bool saw_explore = false;
+	for (int i = 1; i < argc; ++i)
+	{
+		const char *arg = argv[i];
+		if (!arg)
+			continue;
+		if (!std::strcmp(arg, "--explore"))
+			saw_explore = true;
+		if (!std::strcmp(arg, "--no-audio") || !std::strcmp(arg, "--mute"))
+			want_no_audio = true;
+		if (!std::strcmp(arg, "--audio"))
+			want_audio = true;
+	}
+	if (want_no_audio)
+	{
+		g_audio_enabled = false;
+		g_audio_user_set = true;
+		return;
+	}
+	if (want_audio)
+	{
+		g_audio_enabled = true;
+		g_audio_user_set = true;
+		return;
+	}
+	// Default to silent in explore mode unless user opted in.
+	if (saw_explore)
+		g_audio_enabled = false;
+}
 
 static volatile std::sig_atomic_t g_host_stop_signal = 0;
 
@@ -1036,6 +1087,129 @@ static inline void explore_observe_tty_char(u8 ch)
 				return;
 			}
 		}
+	}
+}
+
+static inline void maybe_print_progress(u32 inst_counter)
+{
+	if (!g_progress_every_inst)
+		return;
+
+	const u16 cs = regs16[idx(Reg16::CS)];
+	const u16 ip = reg_ip;
+	if (cs == g_progress_last_cs && ip == g_progress_last_ip)
+		++g_progress_same_csip;
+	else
+	{
+		g_progress_last_cs = cs;
+		g_progress_last_ip = ip;
+		g_progress_same_csip = 0;
+		g_progress_stuck_dumped = false;
+	}
+
+	if (inst_counter && !(inst_counter % g_progress_every_inst))
+	{
+		std::fprintf(stderr,
+			"PROGRESS inst=%u CS:IP=%04X:%04X IF=%u TF=%u disk_r=%llu disk_w=%llu last_disk_inst=%u same_csip=%u\n",
+			(unsigned)inst_counter,
+			(unsigned)cs,
+			(unsigned)ip,
+			(unsigned)regs8[idx(Flag::IF)],
+			(unsigned)regs8[idx(Flag::TF)],
+			(unsigned long long)g_disk_reads,
+			(unsigned long long)g_disk_writes,
+			(unsigned)g_last_diskio_inst,
+			(unsigned)g_progress_same_csip);
+
+		// If we're spinning at the same CS:IP for a while, dump some state once.
+		if (!g_progress_stuck_dumped && g_progress_same_csip >= 10)
+		{
+			g_progress_stuck_dumped = true;
+			const u32 phys = (((u32)cs << 4u) + (u32)ip) & 0xFFFFFu;
+			std::fprintf(stderr,
+				"STUCK? cs:ip=%04X:%04X phys=%05X IF=%u TF=%u raw=%02X xlat=%u disk_r=%llu disk_w=%llu io60=%02X io64=%02X io40=%02X io42=%02X io43=%02X io3DA=%02X\n",
+				(unsigned)cs,
+				(unsigned)ip,
+				(unsigned)phys,
+				(unsigned)regs8[idx(Flag::IF)],
+				(unsigned)regs8[idx(Flag::TF)],
+				(unsigned)raw_opcode_id,
+				(unsigned)xlat_opcode_id,
+				(unsigned long long)g_disk_reads,
+				(unsigned long long)g_disk_writes,
+				(unsigned)io_ports[0x60],
+				(unsigned)io_ports[0x64],
+				(unsigned)io_ports[0x40],
+				(unsigned)io_ports[0x42],
+				(unsigned)io_ports[0x43],
+				(unsigned)io_ports[0x3DA]);
+			std::fprintf(stderr, "STUCK? bytes:");
+			for (u32 i = 0; i < 16; ++i)
+				std::fprintf(stderr, " %02X", (unsigned)mem[(phys + i) & 0xFFFFFu]);
+			std::fprintf(stderr, "\n");
+		}
+	}
+}
+
+static inline void explore_observe_textmode_prompt()
+{
+	if (!g_explore_mode || !g_explore_warmup_active)
+		return;
+	if (g_explore_prompt_seen)
+		return;
+
+	// Many DOSes write the prompt directly into text VRAM instead of going through the BIOS teletype.
+	// Scan the text buffer for a prompt signature like "A:\\>" or "A:\\DOS>".
+	constexpr u32 kTextCols = 80;
+	constexpr u32 kTextRows = 25;
+	constexpr u32 kTextBytes = kTextCols * kTextRows * 2;
+
+	auto scan_base = [&](u32 base) -> bool {
+		if (base + kTextBytes > PHYS_MEM_SIZE)
+			return false;
+		const u8 *vram = mem + base;
+		char row[kTextCols];
+		for (u32 r = 0; r < kTextRows; ++r)
+		{
+			for (u32 c = 0; c < kTextCols; ++c)
+			{
+				const u8 ch = vram[(r * kTextCols + c) * 2u];
+				row[c] = ch ? (char)ch : ' ';
+			}
+
+			// Common DOS prompt form: optional spaces, then "X:", then some path, then ">".
+			u32 start = 0;
+			while (start < kTextCols && row[start] == ' ')
+				++start;
+			if (start + 1 < kTextCols && std::isalpha((unsigned char)row[start]) && row[start + 1] == ':')
+			{
+				for (u32 i = start + 2; i < kTextCols; ++i)
+				{
+					if (row[i] == '>')
+						return true;
+				}
+			}
+
+			// Fallback: look for a trailing ">" preceded by a drive like "A:".
+			for (u32 i = 0; i < kTextCols; ++i)
+			{
+				if (row[i] != '>')
+					continue;
+				if (i >= 3 && row[i - 1] == '\\' && row[i - 2] == ':' && std::isalpha((unsigned char)row[i - 3]))
+					return true;
+				if (i >= 2 && row[i - 1] == ':' && std::isalpha((unsigned char)row[i - 2]))
+					return true;
+			}
+		}
+		return false;
+	};
+
+	// Probe both common text VRAM bases; the BIOS data-area heuristic is not reliable across boot images.
+	if (scan_base(0xB8000u) || scan_base(0xB0000u))
+	{
+		g_explore_prompt_seen = true;
+		g_explore_stop_requested = true;
+		return;
 	}
 }
 
@@ -1720,19 +1894,31 @@ void audio_callback(void *data, Uint8 *stream, int len)
 int main(int argc, char **argv)
 {
 #ifndef NO_GRAPHICS
+	preparse_early_audio_flags(argc, argv);
+#endif
+#ifndef NO_GRAPHICS
 	// Initialise SDL (SDL2)
-	SDL_Init(SDL_INIT_AUDIO | SDL_INIT_VIDEO);
+	Uint32 sdl_flags = SDL_INIT_VIDEO;
+	if (g_audio_enabled)
+		sdl_flags |= SDL_INIT_AUDIO;
+	SDL_Init(sdl_flags);
 	sdl_audio = SDL_AudioSpec{};
-	sdl_audio.freq = 44100;
-	sdl_audio.format = AUDIO_U8;
-	sdl_audio.channels = 1;
-	sdl_audio.samples = 512;
-	sdl_audio.callback = audio_callback;
-	sdl_audio_dev = SDL_OpenAudioDevice(nullptr, 0, &sdl_audio, nullptr, 0);
-	if (sdl_audio_dev)
-		SDL_PauseAudioDevice(sdl_audio_dev, 0);
+	sdl_audio_dev = 0;
+	if (g_audio_enabled)
+	{
+		sdl_audio.freq = 44100;
+		sdl_audio.format = AUDIO_U8;
+		sdl_audio.channels = 1;
+		sdl_audio.samples = 512;
+		sdl_audio.callback = audio_callback;
+		sdl_audio_dev = SDL_OpenAudioDevice(nullptr, 0, &sdl_audio, nullptr, 0);
+		if (sdl_audio_dev)
+			SDL_PauseAudioDevice(sdl_audio_dev, 0);
+	}
 
 	sdl_window.reset();
+	// Parse args early enough to know whether to init SDL audio.
+	// (We still init SDL video for the interactive build unless NO_GRAPHICS is set.)
 	sdl_renderer.reset();
 	sdl_texture.reset();
 #endif
@@ -1785,6 +1971,30 @@ int main(int argc, char **argv)
 				return 2;
 			continue;
 		}
+		if (!std::strcmp(arg, "--progress") && (i + 1) < argc)
+		{
+			if (!parse_u32_flag("--progress", argv[++i], g_progress_every_inst))
+				return 2;
+			continue;
+		}
+		if (!std::strncmp(arg, "--progress=", 11))
+		{
+			if (!parse_u32_flag("--progress", arg + 11, g_progress_every_inst))
+				return 2;
+			continue;
+		}
+		if (!std::strcmp(arg, "--tty-limit") && (i + 1) < argc)
+		{
+			if (!parse_u32_flag("--tty-limit", argv[++i], g_tty_limit_bytes))
+				return 2;
+			continue;
+		}
+		if (!std::strncmp(arg, "--tty-limit=", 12))
+		{
+			if (!parse_u32_flag("--tty-limit", arg + 12, g_tty_limit_bytes))
+				return 2;
+			continue;
+		}
 		if (!std::strcmp(arg, "--explore"))
 		{
 			g_explore_mode = true;
@@ -1829,15 +2039,37 @@ int main(int argc, char **argv)
 			g_run_exe_host_path = argv[++i];
 			continue;
 		}
+		if (!std::strcmp(arg, "--exe") && (i + 1) < argc)
+		{
+			g_run_exe_host_path = argv[++i];
+			continue;
+		}
 		if (!std::strncmp(arg, "--run-exe=", 10))
 		{
 			g_run_exe_host_path = arg + 10;
+			continue;
+		}
+		if (!std::strncmp(arg, "--exe=", 6))
+		{
+			g_run_exe_host_path = arg + 6;
 			continue;
 		}
 		if (!std::strcmp(arg, "--quiet"))
 		{
 			g_quiet_output = true;
 			g_quiet_output_user_set = true;
+			continue;
+		}
+		if (!std::strcmp(arg, "--no-audio") || !std::strcmp(arg, "--mute"))
+		{
+			g_audio_enabled = false;
+			g_audio_user_set = true;
+			continue;
+		}
+		if (!std::strcmp(arg, "--audio"))
+		{
+			g_audio_enabled = true;
+			g_audio_user_set = true;
 			continue;
 		}
 		if (!std::strcmp(arg, "--loud"))
@@ -1926,6 +2158,7 @@ int main(int argc, char **argv)
 			g_scripted_input = true;
 			g_scripted_keys = std::move(tmp);
 			g_scripted_key_pos = 0;
+			g_scripted_input_user_set = true;
 			continue;
 		}
 		if (!std::strncmp(arg, "--keys-file=", 12))
@@ -1940,6 +2173,7 @@ int main(int argc, char **argv)
 			g_scripted_input = true;
 			g_scripted_keys = std::move(tmp);
 			g_scripted_key_pos = 0;
+			g_scripted_input_user_set = true;
 			continue;
 		}
 		if (!std::strcmp(arg, "--keys") && (i + 1) < argc)
@@ -1954,6 +2188,7 @@ int main(int argc, char **argv)
 			g_scripted_input = true;
 			g_scripted_keys = std::move(tmp);
 			g_scripted_key_pos = 0;
+			g_scripted_input_user_set = true;
 			continue;
 		}
 		if (!std::strncmp(arg, "--keys=", 7))
@@ -1968,6 +2203,7 @@ int main(int argc, char **argv)
 			g_scripted_input = true;
 			g_scripted_keys = std::move(tmp);
 			g_scripted_key_pos = 0;
+			g_scripted_input_user_set = true;
 			continue;
 		}
 
@@ -1986,14 +2222,17 @@ int main(int argc, char **argv)
 		// Exploration is headless/high-volume; suppress BIOS PUTCHAR output unless the user opted in.
 		if (!g_quiet_output_user_set)
 			g_quiet_output = true;
+		// Exploration runs shouldn't make noise by default.
+		if (!g_audio_user_set)
+			g_audio_enabled = false;
 	}
 
 	if (positional.size() < 2)
 	{
 		std::fprintf(stderr,
-			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
-			"          [--run-exe host.exe]\n"
-			"          [--quiet|--loud]\n"
+			"Usage: %s [--max-inst N] [--progress N] [--tty-limit N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
+			"          [--run-exe host.exe|--exe host.exe]\n"
+			"          [--quiet|--loud] [--audio|--no-audio]\n"
 			"          [--debug-diskio]\n"
 			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N --explore-warmup-inst N]\n"
 			"          [--explore-save-best path.txt --explore-save-every N --explore-dump-every N]\n"
@@ -2022,6 +2261,40 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		fd_path = g_fd_prepared_path.c_str();
+	}
+
+	// Convenience: if an EXE was injected and the user didn't provide keys, auto-type the program name
+	// at the first DOS prompt keyboard read.
+	if (g_run_exe_host_path && !g_explore_mode && !g_scripted_input_user_set)
+	{
+		std::string base = std::filesystem::path(g_run_exe_host_path).filename().string();
+		char name83[11];
+		std::string prog = "";
+		if (make_dos_83_upper(base, name83))
+		{
+			prog.assign(name83, name83 + 8);
+			while (!prog.empty() && prog.back() == ' ')
+				prog.pop_back();
+		}
+		else
+		{
+			// Fallback: just strip extension and uppercase.
+			prog = std::filesystem::path(base).stem().string();
+			for (char &c : prog)
+				c = (char)std::toupper((unsigned char)c);
+		}
+		if (!prog.empty())
+		{
+			std::vector<u8> ascii;
+			ascii.reserve(prog.size() + 1);
+			for (char c : prog)
+				ascii.push_back((u8)c);
+			ascii.push_back(0x0D);
+			g_scripted_input = true;
+			g_scripted_keys = make_key_words_from_ascii(ascii);
+			g_scripted_key_pos = 0;
+			std::fprintf(stderr, "Auto-run: will type '%s' + Enter at prompt.\n", prog.c_str());
+		}
 	}
 
 	if (g_dump_instr_path || g_explore_mode)
@@ -2072,6 +2345,22 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "Failed to open BIOS image: %s\n", bios_path);
 		return 2;
 	}
+	{
+		const std::int64_t bios_size = platform::seek_end_bytes(disk[2]);
+		platform::seek_set_bytes(disk[2], 0);
+		// This emulator expects a BIOS image that includes the helper tables and full code region.
+		// We read 0xFF00 bytes into F000:0100.
+		if (bios_size > 0 && bios_size < 0xFF00)
+		{
+			std::fprintf(stderr,
+				"Fatal: BIOS image '%s' is too small (%lld bytes). Expected at least %u bytes.\n"
+				"Hint: rebuild the BIOS from bios_source/bios.asm (e.g., with nasm) or provide a correct BIOS binary.\n",
+				bios_path,
+				(long long)bios_size,
+				(unsigned)0xFF00);
+			return 2;
+		}
+	}
 	if (disk[1] <= 0)
 	{
 		std::fprintf(stderr, "Failed to open floppy image: %s\n", fd_path);
@@ -2085,7 +2374,25 @@ int main(int argc, char **argv)
 	ref<unsigned>(regs16[idx(Reg16::AX)]) = (disk_size_bytes > 0) ? (unsigned)(disk_size_bytes >> 9) : 0;
 
 	// Load BIOS image into F000:0100, and set IP to 0100
-	platform::read_fd(disk[2], regs8 + (reg_ip = 0x100), 0xFF00);
+	{
+		reg_ip = 0x100;
+		const std::int64_t bios_read = platform::read_fd(disk[2], regs8 + reg_ip, 0xFF00);
+		if (bios_read < 0)
+		{
+			std::perror("BIOS read");
+			return 2;
+		}
+		if (bios_read != 0xFF00)
+		{
+			std::fprintf(stderr,
+				"Fatal: BIOS read short from '%s': got %lld bytes, expected %u.\n"
+				"Hint: provide a correct BIOS binary (must include decoder tables).\n",
+				bios_path,
+				(long long)bios_read,
+				(unsigned)0xFF00);
+			return 2;
+		}
+	}
 
 	// Load instruction decoding helper table
 	for (int i = 0; i < 20; i++)
@@ -2702,7 +3009,20 @@ int main(int argc, char **argv)
 						const u8 ch = regs8[idx(Reg8::AL)];
 						explore_observe_tty_char(ch);
 						if (!g_quiet_output)
-							platform::write_fd(1, &ch, 1);
+						{
+							// Guardrail: loud boot logs can be enormous; allow capping to keep the terminal responsive.
+							if (g_tty_limit_bytes && !g_tty_limit_tripped && g_tty_bytes_written >= g_tty_limit_bytes)
+							{
+								g_tty_limit_tripped = true;
+								g_quiet_output = true;
+								std::fprintf(stderr, "TTY output capped at %u bytes; switching to --quiet. Use --tty-limit 0 to disable.\n", (unsigned)g_tty_limit_bytes);
+							}
+							else
+							{
+								platform::write_fd(1, &ch, 1);
+								++g_tty_bytes_written;
+							}
+						}
 						break;
 					}
 						break;
@@ -2727,11 +3047,16 @@ int main(int argc, char **argv)
 					case EmulatorOp::DISK_READ:
 					case EmulatorOp::DISK_WRITE:
 					{
+						const bool is_write = static_cast<EmulatorOp>((char)i_data0) == EmulatorOp::DISK_WRITE;
+						if (is_write)
+							++g_disk_writes;
+						else
+							++g_disk_reads;
+						g_last_diskio_inst = inst_counter;
 						const u8 dl = regs8[idx(Reg8::DL)];
 						const int fd = (dl & 0x80u) ? disk[0] : disk[1];
 						const unsigned int byte_count = regs16[idx(Reg16::AX)];
 						u8 *buf = mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]);
-						const bool is_write = ((char)i_data0 == 3);
 
 						if (byte_count > RAM_SIZE)
 						{
@@ -2811,12 +3136,36 @@ int main(int argc, char **argv)
 				set_CF(0), set_OF(0);
 		}
 
-		// Poll timer/keyboard every kKeyboardTimerUpdateDelay instructions
-		if (!(++inst_counter % kKeyboardTimerUpdateDelay))
+		// Poll timer/keyboard periodically; explore warmup can run with a higher tick rate to
+		// reach a usable prompt sooner (many boot paths wait on timer ticks).
+		const u32 timer_delay = (g_explore_mode && g_explore_warmup_active)
+			? kExploreWarmupKeyboardTimerUpdateDelay
+			: kKeyboardTimerUpdateDelay;
+		if (!(++inst_counter % timer_delay))
 			int8_asap = 1;
 
+		maybe_print_progress(inst_counter);
+
+		// Exploration warmup: also look for the DOS prompt in text VRAM.
+		// Keep the scan infrequent to avoid overhead.
+		if (g_explore_mode && g_explore_warmup_active && !g_explore_prompt_seen)
+		{
+			if (!(inst_counter % 20000u))
+				explore_observe_textmode_prompt();
+		}
+
 		if (g_max_instructions && inst_counter >= g_max_instructions)
+		{
+			std::fprintf(stderr,
+				"STOP: reached --max-inst=%u at inst=%u CS:IP=%04X:%04X IF=%u TF=%u\n",
+				(unsigned)g_max_instructions,
+				(unsigned)inst_counter,
+				(unsigned)regs16[idx(Reg16::CS)],
+				(unsigned)reg_ip,
+				(unsigned)regs8[idx(Flag::IF)],
+				(unsigned)regs8[idx(Flag::TF)]);
 			break;
+		}
 
 		if (g_explore_stop_requested)
 		{
@@ -2930,7 +3279,16 @@ int main(int argc, char **argv)
 				if (next > prev)
 				{
 					g_max_instructions = next;
-					std::fprintf(stderr, "Explore warmup: extending budget to %u instructions (boot not ready yet).\n", (unsigned)g_max_instructions);
+					std::fprintf(stderr,
+						"Explore warmup: extending budget to %u instructions (boot not ready yet) CS:IP=%04X:%04X IF=%u TF=%u disk_r=%llu disk_w=%llu last_disk_inst=%u\n",
+						(unsigned)g_max_instructions,
+						(unsigned)regs16[idx(Reg16::CS)],
+						(unsigned)reg_ip,
+						(unsigned)regs8[idx(Flag::IF)],
+						(unsigned)regs8[idx(Flag::TF)],
+						(unsigned long long)g_disk_reads,
+						(unsigned long long)g_disk_writes,
+						(unsigned)g_last_diskio_inst);
 					goto run_loop;
 				}
 			}
@@ -2939,7 +3297,21 @@ int main(int argc, char **argv)
 			// so exploration measures only from the prompt onward.
 			g_explore_warmup_active = false;
 			if (!g_explore_prompt_seen)
-				std::fprintf(stderr, "Warning: explore warmup ended without detecting a DOS prompt; increase --explore-warmup-inst or run with --loud to inspect boot output.\n");
+			{
+				std::fprintf(stderr,
+					"Warning: explore warmup ended without detecting a DOS prompt.\n"
+					"  Last CS:IP=%04X:%04X IF=%u TF=%u disk_r=%llu disk_w=%llu last_disk_inst=%u\n"
+					"  Hint: increase --explore-warmup-inst, run with --progress, or validate BIOS/floppy images.\n",
+					(unsigned)regs16[idx(Reg16::CS)],
+					(unsigned)reg_ip,
+					(unsigned)regs8[idx(Flag::IF)],
+					(unsigned)regs8[idx(Flag::TF)],
+					(unsigned long long)g_disk_reads,
+					(unsigned long long)g_disk_writes,
+					(unsigned)g_last_diskio_inst);
+				if (!g_explore_tty_tail.empty())
+					std::fprintf(stderr, "  TTY tail (may be partial): %s\n", g_explore_tty_tail.c_str());
+			}
 			g_explore_tty_tail.clear();
 			base_snapshot = make_snapshot();
 
