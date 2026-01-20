@@ -2,9 +2,6 @@
 // Copyright 2013-14, Adrian Cable (adrian.cable@gmail.com) - http://www.megalith.co.uk/8086tiny
 //
 // Revision 1.25
-//
-// This work is licensed under the MIT License. See included LICENSE.TXT.
-
 #include <ctime>
 #include <cstring>
 #include <cstdlib>
@@ -19,6 +16,7 @@
 #include <random>
 #include <csignal>
 #include <cerrno>
+#include <filesystem>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -602,6 +600,9 @@ static const char *g_explore_best_keys_path = nullptr;
 static u32 g_explore_save_every = 200; // iterations; 0 disables periodic save
 static u32 g_explore_dump_every = 0;   // iterations; 0 disables periodic dump
 
+static const char *g_run_exe_host_path = nullptr;
+static std::string g_fd_prepared_path;
+
 static volatile std::sig_atomic_t g_host_stop_signal = 0;
 
 static void on_host_signal(int sig)
@@ -741,6 +742,259 @@ static bool save_keys_file(const char *path, const std::vector<u8> &ascii)
 	}
 	line.push_back('\n');
 	return write_text_file_atomic(path, line);
+}
+
+static bool copy_file_binary(const char *src, const char *dst)
+{
+	std::ifstream in(src, std::ios::binary);
+	if (!in)
+		return false;
+	std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+	if (!out)
+		return false;
+	out << in.rdbuf();
+	return (bool)out;
+}
+
+static inline u16 rd16(const u8 *p) noexcept { return (u16)p[0] | ((u16)p[1] << 8); }
+static inline u32 rd32(const u8 *p) noexcept { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+
+static u16 fat12_get(const std::vector<u8> &fat, u32 cluster)
+{
+	const u32 off = (cluster * 3u) / 2u;
+	if (off + 1u >= fat.size())
+		return 0xFFF;
+	const u16 v = (u16)fat[off] | ((u16)fat[off + 1u] << 8);
+	return (cluster & 1u) ? (u16)(v >> 4) : (u16)(v & 0x0FFFu);
+}
+
+static void fat12_set(std::vector<u8> &fat, u32 cluster, u16 value)
+{
+	value &= 0x0FFFu;
+	const u32 off = (cluster * 3u) / 2u;
+	if (off + 1u >= fat.size())
+		return;
+	const u16 cur = (u16)fat[off] | ((u16)fat[off + 1u] << 8);
+	const u16 next = (cluster & 1u)
+		? (u16)((cur & 0x000Fu) | (value << 4))
+		: (u16)((cur & 0xF000u) | value);
+	fat[off] = (u8)(next & 0xFFu);
+	fat[off + 1u] = (u8)((next >> 8) & 0xFFu);
+}
+
+static bool make_dos_83_upper(const std::string &filename, char out_name[11])
+{
+	std::memset(out_name, ' ', 11);
+	std::string base = filename;
+	// strip any directory
+	const std::size_t slash = base.find_last_of("/\\");
+	if (slash != std::string::npos)
+		base = base.substr(slash + 1);
+	// split ext
+	std::string stem, ext;
+	const std::size_t dot = base.find_last_of('.');
+	if (dot != std::string::npos)
+	{
+		stem = base.substr(0, dot);
+		ext = base.substr(dot + 1);
+	}
+	else
+	{
+		stem = base;
+	}
+	if (stem.empty())
+		return false;
+	auto norm = [](char c) -> char {
+		c = (char)std::toupper((unsigned char)c);
+		if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '~')
+			return c;
+		return '_';
+	};
+	for (std::size_t i = 0; i < stem.size() && i < 8u; ++i)
+		out_name[i] = norm(stem[i]);
+	for (std::size_t i = 0; i < ext.size() && i < 3u; ++i)
+		out_name[8u + i] = norm(ext[i]);
+	return true;
+}
+
+// Inject a host file into the root directory of a FAT12 floppy image.
+// Supports classic FreeDOS boot floppies (FAT12, root dir, no subdirs).
+static bool fat12_inject_root_file(const char *img_path, const char *host_path, const char *dest_83)
+{
+	std::ifstream host(host_path, std::ios::binary);
+	if (!host)
+	{
+		std::fprintf(stderr, "--run-exe: failed to open host file: %s\n", host_path);
+		return false;
+	}
+	std::vector<u8> file((std::istreambuf_iterator<char>(host)), std::istreambuf_iterator<char>());
+	if (file.empty())
+	{
+		std::fprintf(stderr, "--run-exe: host file is empty: %s\n", host_path);
+		return false;
+	}
+
+	std::fstream img(img_path, std::ios::in | std::ios::out | std::ios::binary);
+	if (!img)
+	{
+		std::fprintf(stderr, "--run-exe: failed to open disk image for writing: %s\n", img_path);
+		return false;
+	}
+
+	// Read boot sector
+	std::vector<u8> boot(512);
+	img.seekg(0);
+	img.read((char *)boot.data(), (std::streamsize)boot.size());
+	if (!img)
+		return false;
+
+	const u16 bytes_per_sector = rd16(&boot[11]);
+	const u8 sectors_per_cluster = boot[13];
+	const u16 reserved_sectors = rd16(&boot[14]);
+	const u8 num_fats = boot[16];
+	const u16 root_entry_count = rd16(&boot[17]);
+	const u16 total_sectors16 = rd16(&boot[19]);
+	const u16 fat_size16 = rd16(&boot[22]);
+	const u32 total_sectors = total_sectors16 ? (u32)total_sectors16 : rd32(&boot[32]);
+	if (bytes_per_sector == 0 || sectors_per_cluster == 0 || reserved_sectors == 0 || num_fats == 0 || fat_size16 == 0 || root_entry_count == 0 || total_sectors == 0)
+	{
+		std::fprintf(stderr, "--run-exe: unsupported/invalid BPB in %s\n", img_path);
+		return false;
+	}
+	const u32 root_dir_sectors = (u32)((root_entry_count * 32u + bytes_per_sector - 1u) / bytes_per_sector);
+	const u32 fat_bytes = (u32)fat_size16 * (u32)bytes_per_sector;
+	const u32 fat0_offset = (u32)reserved_sectors * (u32)bytes_per_sector;
+	const u32 root_offset = (u32)(reserved_sectors + (u32)num_fats * (u32)fat_size16) * (u32)bytes_per_sector;
+	const u32 data_offset = (u32)(reserved_sectors + (u32)num_fats * (u32)fat_size16 + root_dir_sectors) * (u32)bytes_per_sector;
+	const u32 cluster_bytes = (u32)sectors_per_cluster * (u32)bytes_per_sector;
+	const u32 data_sectors = total_sectors - (u32)reserved_sectors - (u32)num_fats * (u32)fat_size16 - root_dir_sectors;
+	const u32 cluster_count = data_sectors / sectors_per_cluster;
+	if (cluster_count < 4)
+		return false;
+
+	// Load FAT0
+	std::vector<u8> fat(fat_bytes);
+	img.seekg((std::streamoff)fat0_offset);
+	img.read((char *)fat.data(), (std::streamsize)fat.size());
+	if (!img)
+		return false;
+
+	// Load root directory
+	std::vector<u8> root(root_dir_sectors * (u32)bytes_per_sector);
+	img.seekg((std::streamoff)root_offset);
+	img.read((char *)root.data(), (std::streamsize)root.size());
+	if (!img)
+		return false;
+
+	char name83[11];
+	if (dest_83 && *dest_83)
+	{
+		if (!make_dos_83_upper(dest_83, name83))
+			return false;
+	}
+	else
+	{
+		if (!make_dos_83_upper(std::filesystem::path(host_path).filename().string(), name83))
+			return false;
+	}
+
+	// Find existing file or a free directory entry.
+	int free_entry = -1;
+	for (u32 i = 0; i + 32u <= root.size(); i += 32u)
+	{
+		const u8 first = root[i];
+		if (first == 0x00 || first == 0xE5)
+		{
+			if (free_entry < 0)
+				free_entry = (int)i;
+			if (first == 0x00)
+				break;
+			continue;
+		}
+		if (std::memcmp(&root[i], name83, 11) == 0)
+		{
+			std::fprintf(stderr, "--run-exe: file already exists in image: %.8s.%.3s\n", name83, name83 + 8);
+			return false;
+		}
+	}
+	if (free_entry < 0)
+	{
+		std::fprintf(stderr, "--run-exe: no free root dir entries\n");
+		return false;
+	}
+
+	// Allocate clusters
+	const u32 need_clusters = (u32)((file.size() + cluster_bytes - 1u) / cluster_bytes);
+	std::vector<u16> chain;
+	chain.reserve(need_clusters);
+	for (u32 c = 2; c < 2 + cluster_count && chain.size() < need_clusters; ++c)
+	{
+		if (fat12_get(fat, c) == 0)
+			chain.push_back((u16)c);
+	}
+	if (chain.size() != need_clusters)
+	{
+		std::fprintf(stderr, "--run-exe: not enough free clusters (%u needed)\n", (unsigned)need_clusters);
+		return false;
+	}
+	for (u32 i = 0; i < chain.size(); ++i)
+	{
+		const u16 cur = chain[i];
+		const u16 next = (i + 1u < chain.size()) ? chain[i + 1u] : (u16)0xFFFu;
+		fat12_set(fat, cur, next);
+	}
+
+	// Write file data clusters
+	std::size_t written = 0;
+	for (u32 i = 0; i < chain.size(); ++i)
+	{
+		const u32 cluster = (u32)chain[i];
+		const u32 off = data_offset + (cluster - 2u) * cluster_bytes;
+		const std::size_t chunk = std::min<std::size_t>(cluster_bytes, file.size() - written);
+		img.seekp((std::streamoff)off);
+		img.write((const char *)(file.data() + written), (std::streamsize)chunk);
+		if (!img)
+			return false;
+		if (chunk < cluster_bytes)
+		{
+			std::vector<u8> zeros(cluster_bytes - chunk, 0);
+			img.write((const char *)zeros.data(), (std::streamsize)zeros.size());
+			if (!img)
+				return false;
+		}
+		written += chunk;
+	}
+
+	// Write FATs back
+	for (u8 fi = 0; fi < num_fats; ++fi)
+	{
+		const u32 off = fat0_offset + (u32)fi * fat_bytes;
+		img.seekp((std::streamoff)off);
+		img.write((const char *)fat.data(), (std::streamsize)fat.size());
+		if (!img)
+			return false;
+	}
+
+	// Write directory entry
+	u8 entry[32] = {0};
+	std::memcpy(entry, name83, 11);
+	entry[11] = 0x20; // archive
+	// time/date left as 0
+	const u16 first_cluster = chain.empty() ? 0 : chain.front();
+	entry[26] = (u8)(first_cluster & 0xFFu);
+	entry[27] = (u8)((first_cluster >> 8) & 0xFFu);
+	const u32 file_size = (u32)file.size();
+	entry[28] = (u8)(file_size & 0xFFu);
+	entry[29] = (u8)((file_size >> 8) & 0xFFu);
+	entry[30] = (u8)((file_size >> 16) & 0xFFu);
+	entry[31] = (u8)((file_size >> 24) & 0xFFu);
+	std::memcpy(&root[(std::size_t)free_entry], entry, 32);
+	img.seekp((std::streamoff)root_offset);
+	img.write((const char *)root.data(), (std::streamsize)root.size());
+	if (!img)
+		return false;
+
+	return true;
 }
 
 static inline void explore_observe_tty_char(u8 ch)
@@ -1570,6 +1824,16 @@ int main(int argc, char **argv)
 				return 2;
 			continue;
 		}
+		if (!std::strcmp(arg, "--run-exe") && (i + 1) < argc)
+		{
+			g_run_exe_host_path = argv[++i];
+			continue;
+		}
+		if (!std::strncmp(arg, "--run-exe=", 10))
+		{
+			g_run_exe_host_path = arg + 10;
+			continue;
+		}
 		if (!std::strcmp(arg, "--quiet"))
 		{
 			g_quiet_output = true;
@@ -1728,6 +1992,7 @@ int main(int argc, char **argv)
 	{
 		std::fprintf(stderr,
 			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
+			"          [--run-exe host.exe]\n"
 			"          [--quiet|--loud]\n"
 			"          [--debug-diskio]\n"
 			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N --explore-warmup-inst N]\n"
@@ -1740,6 +2005,24 @@ int main(int argc, char **argv)
 	const char *bios_path = positional[0];
 	const char *fd_path = positional[1];
 	const char *hd_path = (positional.size() >= 3) ? positional[2] : nullptr;
+
+	// Optional: copy fd.img, inject the requested EXE into the FAT12 root directory,
+	// and boot from the prepared image.
+	if (g_run_exe_host_path)
+	{
+		g_fd_prepared_path = std::string(fd_path) + ".run.img";
+		if (!copy_file_binary(fd_path, g_fd_prepared_path.c_str()))
+		{
+			std::fprintf(stderr, "--run-exe: failed to copy %s -> %s\n", fd_path, g_fd_prepared_path.c_str());
+			return 1;
+		}
+		if (!fat12_inject_root_file(g_fd_prepared_path.c_str(), g_run_exe_host_path, nullptr))
+		{
+			std::fprintf(stderr, "--run-exe: failed to inject %s into %s\n", g_run_exe_host_path, g_fd_prepared_path.c_str());
+			return 1;
+		}
+		fd_path = g_fd_prepared_path.c_str();
+	}
 
 	if (g_dump_instr_path || g_explore_mode)
 		g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
@@ -1817,7 +2100,7 @@ int main(int argc, char **argv)
 	std::vector<u8> explore_current;
 	std::vector<u8> explore_user_seed_ascii;
 	u32 explore_saved_max_inst = 0;
-	u32 explore_warmup_ext_left = 4;
+	u32 explore_warmup_ext_left = 12;
 	u32 explore_iter = 0;
 	u32 explore_best_gain = 0;
 	std::vector<u8> explore_best_seq;
@@ -2352,9 +2635,16 @@ int main(int argc, char **argv)
 						{
 							if (g_explore_mode)
 							{
-								// Exploration: stop the host run without mutating guest state.
 								if (g_explore_warmup_active)
-									g_explore_prompt_seen = true;
+								{
+									// Warmup should be non-blocking: many DOS boot menus wait for a key.
+									// Synthesize ENTER to accept the default path and keep booting.
+									regs8[idx(Reg8::AL)] = 0x0D;
+									regs8[idx(Reg8::AH)] = 0;
+									reg_ip += 2;
+									break;
+								}
+								// Exploration run: stop the host run without blocking forever.
 								g_explore_stop_requested = true;
 								break;
 							}
@@ -2636,7 +2926,7 @@ int main(int argc, char **argv)
 			{
 				--explore_warmup_ext_left;
 				const u32 prev = g_max_instructions;
-				const u32 next = (prev < 50000000u) ? (prev * 2u) : 50000000u;
+				const u32 next = (prev < 500000000u) ? (prev * 2u) : 500000000u;
 				if (next > prev)
 				{
 					g_max_instructions = next;
@@ -2662,8 +2952,26 @@ int main(int argc, char **argv)
 				g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
 
 			explore_corpus.clear();
-			// Seed: launch Gorilla from the boot floppy (A:).
-			explore_corpus.push_back(std::vector<u8>{'G','O','R','I','L','L','A',0x0D});
+			// Seed: launch a program from the boot floppy (typically already at A:>).
+			{
+				std::string prog = "GORILLA";
+				if (g_run_exe_host_path)
+				{
+					std::string base = std::filesystem::path(g_run_exe_host_path).filename().string();
+					char name83[11];
+					if (make_dos_83_upper(base, name83))
+					{
+						prog.assign(name83, name83 + 8);
+						while (!prog.empty() && prog.back() == ' ')
+							prog.pop_back();
+					}
+				}
+				std::vector<u8> seed;
+				for (char c : prog)
+					seed.push_back((u8)c);
+				seed.push_back(0x0D);
+				explore_corpus.push_back(std::move(seed));
+			}
 			if (!explore_user_seed_ascii.empty())
 				explore_corpus.push_back(explore_user_seed_ascii);
 
