@@ -124,56 +124,73 @@ struct MemRef
 {
 	u8 *p;
 
-	operator T() const
+	static inline T load(const u8 *ptr) noexcept
 	{
+		if constexpr (sizeof(T) == 1)
+			return (T)*ptr;
 		T v;
-		std::memcpy(&v, p, sizeof(T));
+		std::memcpy(&v, ptr, sizeof(T));
 		return v;
 	}
 
-	MemRef &operator=(T v)
+	static inline void store(u8 *ptr, T v) noexcept
 	{
-		std::memcpy(p, &v, sizeof(T));
+		if constexpr (sizeof(T) == 1)
+		{
+			*ptr = (u8)v;
+			return;
+		}
+		std::memcpy(ptr, &v, sizeof(T));
+	}
+
+	operator T() const noexcept
+	{
+		return load(p);
+	}
+
+	MemRef &operator=(T v) noexcept
+	{
+		store(p, v);
 		return *this;
 	}
 
-	MemRef &operator+=(T rhs)
+	MemRef &operator+=(T rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v + rhs);
 		return (*this = v);
 	}
-	MemRef &operator-=(T rhs)
+	MemRef &operator-=(T rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v - rhs);
 		return (*this = v);
 	}
-	MemRef &operator^=(T rhs)
+	MemRef &operator^=(T rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v ^ rhs);
 		return (*this = v);
 	}
-	MemRef &operator|=(T rhs)
+	MemRef &operator|=(T rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v | rhs);
 		return (*this = v);
 	}
-	MemRef &operator&=(T rhs)
+	MemRef &operator&=(T rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v & rhs);
 		return (*this = v);
 	}
-	MemRef &operator<<=(int rhs)
+	MemRef &operator<<=(int rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v << rhs);
 		return (*this = v);
 	}
-	MemRef &operator>>=(int rhs)
+	MemRef &operator>>=(int rhs) noexcept
 	{
 		T v = (T)*this;
 		v = (T)(v >> rhs);
@@ -182,13 +199,13 @@ struct MemRef
 };
 
 template <typename T, typename U>
-static inline MemRef<T> ref(U &x)
+static inline MemRef<T> ref(U &x) noexcept
 {
 	return MemRef<T>{reinterpret_cast<u8 *>(&x)};
 }
 
 template <typename T, typename U>
-static inline T val(U &&x)
+static inline T val(U &&x) noexcept
 {
 	if constexpr (std::is_lvalue_reference_v<U &&>)
 		return (T)MemRef<T>{reinterpret_cast<u8 *>(&x)};
@@ -331,25 +348,25 @@ static int sdl_keyboard_driver()
 // Helper functions
 
 // Set carry flag
-char set_CF(int new_CF)
+static inline char set_CF(int new_CF)
 {
 	return regs8[FLAG_CF] = !!new_CF;
 }
 
 // Set auxiliary flag
-char set_AF(int new_AF)
+static inline char set_AF(int new_AF)
 {
 	return regs8[FLAG_AF] = !!new_AF;
 }
 
 // Set overflow flag
-char set_OF(int new_OF)
+static inline char set_OF(int new_OF)
 {
 	return regs8[FLAG_OF] = !!new_OF;
 }
 
 // Set auxiliary and overflow flag after arithmetic operations
-char set_AF_OF_arith()
+static inline char set_AF_OF_arith()
 {
 	set_AF((op_source ^= op_dest ^ op_result) & 0x10);
 	if (op_result == op_dest)
@@ -359,7 +376,7 @@ char set_AF_OF_arith()
 }
 
 // Assemble and return emulated CPU FLAGS register in scratch_uint
-void make_flags()
+static inline void make_flags()
 {
 	scratch_uint = 0xF002; // 8086 has reserved and unused flags set to 1
 	for (int i = 9; i--;)
@@ -367,7 +384,7 @@ void make_flags()
 }
 
 // Set emulated CPU FLAGS register from regs8[FLAG_xx] values
-void set_flags(int new_flags)
+static inline void set_flags(int new_flags)
 {
 	for (int i = 9; i--;)
 		regs8[FLAG_CF + i] = !!(1 << bios_table_lookup[TABLE_FLAGS_BITFIELDS][i] & new_flags);
@@ -375,7 +392,7 @@ void set_flags(int new_flags)
 
 // Convert raw opcode to translated opcode index. This condenses a large number of different encodings of similar
 // instructions into a much smaller number of distinct functions, which we then execute
-void set_opcode(unsigned char opcode)
+static inline void set_opcode(unsigned char opcode)
 {
 	xlat_opcode_id = bios_table_lookup[TABLE_XLAT_OPCODE][raw_opcode_id = opcode];
 	extra = bios_table_lookup[TABLE_XLAT_SUBFUNCTION][opcode];
@@ -845,16 +862,26 @@ int main(int argc, char **argv)
 						int fd = disk[regs8[REG_DL]];
 						unsigned int lba_offset = (unsigned int)regs16[REG_BP] << 9;
 						unsigned int byte_count = regs16[REG_AX];
+						u8 *buf = mem + SEGREG(REG_ES, REG_BX,);
 
+#if !defined(_WIN32)
+						size_t count = (size_t)byte_count;
+						off_t offset = (off_t)lba_offset;
+						ssize_t rv = ((char)i_data0 == 3)
+							? pwrite(fd, buf, count, offset)
+							: pread(fd, buf, count, offset);
+						regs8[REG_AL] = (rv < 0) ? 0 : (u8)rv;
+#else
 						if (lseek(fd, (off_t)lba_offset, 0) != (off_t)-1)
 						{
 							int rv = ((char)i_data0 == 3)
-								? (int)write(fd, mem + SEGREG(REG_ES, REG_BX,), byte_count)
-								: (int)read(fd, mem + SEGREG(REG_ES, REG_BX,), byte_count);
+								? (int)write(fd, buf, byte_count)
+								: (int)read(fd, buf, byte_count);
 							regs8[REG_AL] = (unsigned char)rv;
 						}
 						else
 							regs8[REG_AL] = 0;
+#endif
 					}
 				}
 		}
