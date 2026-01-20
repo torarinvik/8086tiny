@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -37,6 +38,7 @@ constexpr std::size_t IO_PORT_COUNT = 0x10000;
 constexpr std::size_t RAM_SIZE = 0x10FFF0;
 constexpr std::size_t REGS_BASE = 0xF0000;
 constexpr std::size_t VIDEO_RAM_SIZE = 0x10000;
+constexpr std::size_t PHYS_MEM_SIZE = 0x100000; // 20-bit, 1MB physical address space
 
 // Graphics/timer/keyboard update delays (explained later)
 #ifndef GRAPHICS_UPDATE_DELAY
@@ -536,6 +538,117 @@ s32 op_result, disk[3], scratch_int;
 time_t clock_buf;
 struct timeb ms_clock;
 
+// --- Exploration instrumentation (enabled only when flags are provided) ---
+
+struct InstrInfo
+{
+	u32 exec_count = 0;
+	u16 variant_mismatches = 0;
+	u8 len = 0;
+	std::array<u8, 15> bytes{};
+};
+
+struct DecisionPoint
+{
+	u32 inst_index = 0;
+	u16 cs = 0;
+	u16 ip = 0;
+	u32 phys = 0;
+	u8 ah = 0;
+};
+
+static std::vector<InstrInfo> g_instr_map; // indexed by 20-bit physical address
+static std::vector<DecisionPoint> g_decision_points;
+static const char *g_dump_instr_path = nullptr;
+static const char *g_dump_decisions_path = nullptr;
+static u32 g_max_instructions = 0; // 0 = unlimited
+
+static inline u32 phys20(u16 seg, u16 off) noexcept
+{
+	return (16u * (u32)seg + (u32)off) & (u32)(PHYS_MEM_SIZE - 1u);
+}
+
+static inline u32 compute_inst_len() noexcept
+{
+	return (u32)((i_mod*(i_mod != 3) + 2*(!i_mod && i_rm == 6))*i_mod_size
+		+ bios_table_lookup[idx(BiosTable::BASE_INST_SIZE)][raw_opcode_id]
+		+ bios_table_lookup[idx(BiosTable::I_W_SIZE)][raw_opcode_id]*(i_w + 1));
+}
+
+static inline void record_instruction(u32 phys, const u8 *stream, u32 inst_len) noexcept
+{
+	if (g_instr_map.empty())
+		return;
+	if (phys >= g_instr_map.size())
+		return;
+
+	InstrInfo &info = g_instr_map[phys];
+	++info.exec_count;
+
+	const u8 stored_len = info.len;
+	const u8 clamped_len = (u8)((inst_len > info.bytes.size()) ? info.bytes.size() : inst_len);
+
+	if (info.exec_count == 1)
+	{
+		info.len = clamped_len;
+		for (u32 i = 0; i < clamped_len; ++i)
+			info.bytes[i] = stream[i];
+		return;
+	}
+
+	bool mismatch = (stored_len != clamped_len);
+	if (!mismatch)
+		for (u32 i = 0; i < clamped_len; ++i)
+			mismatch |= (info.bytes[i] != stream[i]);
+	if (mismatch)
+		++info.variant_mismatches;
+}
+
+static void dump_instr_map_to_file(const char *path)
+{
+	if (!path || g_instr_map.empty())
+		return;
+	std::FILE *f = std::fopen(path, "w");
+	if (!f)
+	{
+		std::perror("fopen dump-instr");
+		return;
+	}
+	std::fprintf(f, "phys20,len,bytes_hex,exec_count,variant_mismatches\n");
+	for (u32 phys = 0; phys < (u32)g_instr_map.size(); ++phys)
+	{
+		const InstrInfo &info = g_instr_map[phys];
+		if (!info.exec_count)
+			continue;
+		std::fprintf(f, "%05X,%u,", (unsigned)phys, (unsigned)info.len);
+		for (u32 i = 0; i < (u32)info.len && i < (u32)info.bytes.size(); ++i)
+			std::fprintf(f, "%02X", (unsigned)info.bytes[i]);
+		std::fprintf(f, ",%u,%u\n", (unsigned)info.exec_count, (unsigned)info.variant_mismatches);
+	}
+	std::fclose(f);
+}
+
+static void dump_decisions_to_file(const char *path)
+{
+	if (!path || g_decision_points.empty())
+		return;
+	std::FILE *f = std::fopen(path, "w");
+	if (!f)
+	{
+		std::perror("fopen dump-decisions");
+		return;
+	}
+	std::fprintf(f, "inst_index,cs,ip,phys20,ah\n");
+	for (const DecisionPoint &dp : g_decision_points)
+		std::fprintf(f, "%u,%04X,%04X,%05X,%02X\n",
+			(unsigned)dp.inst_index,
+			(unsigned)dp.cs,
+			(unsigned)dp.ip,
+			(unsigned)dp.phys,
+			(unsigned)dp.ah);
+	std::fclose(f);
+}
+
 static inline void decode_rm_reg()
 {
 	scratch2_uint = 4u * !i_mod;
@@ -921,11 +1034,62 @@ int main(int argc, char **argv)
 	sdl_texture.reset();
 #endif
 
-	if (argc < 3)
+	std::vector<const char *> positional;
+	positional.reserve((std::size_t)argc);
+	for (int i = 1; i < argc; ++i)
 	{
-		std::fprintf(stderr, "Usage: %s bios fd.img [hd.img]\n", argv[0]);
+		const char *arg = argv[i];
+		if (!arg)
+			continue;
+
+		if (!std::strcmp(arg, "--dump-instr") && (i + 1) < argc)
+		{
+			g_dump_instr_path = argv[++i];
+			continue;
+		}
+		if (!std::strncmp(arg, "--dump-instr=", 12))
+		{
+			g_dump_instr_path = arg + 12;
+			continue;
+		}
+		if (!std::strcmp(arg, "--dump-decisions") && (i + 1) < argc)
+		{
+			g_dump_decisions_path = argv[++i];
+			continue;
+		}
+		if (!std::strncmp(arg, "--dump-decisions=", 17))
+		{
+			g_dump_decisions_path = arg + 17;
+			continue;
+		}
+		if (!std::strcmp(arg, "--max-inst") && (i + 1) < argc)
+		{
+			g_max_instructions = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--max-inst=", 11))
+		{
+			g_max_instructions = (u32)std::strtoul(arg + 11, nullptr, 10);
+			continue;
+		}
+
+		positional.push_back(arg);
+	}
+
+	if (positional.size() < 2)
+	{
+		std::fprintf(stderr,
+			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] bios fd.img [hd.img]\n",
+			argv[0]);
 		return 1;
 	}
+
+	const char *bios_path = positional[0];
+	const char *fd_path = positional[1];
+	const char *hd_path = (positional.size() >= 3) ? positional[2] : nullptr;
+
+	if (g_dump_instr_path)
+		g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
 
 	// regs16 and reg8 point to F000:0, the start of memory-mapped registers. CS is initialised to F000
 	regs8 = mem + REGS_BASE;
@@ -937,20 +1101,27 @@ int main(int argc, char **argv)
 
 	// Set DL equal to the boot device: 0 for the FD, or 0x80 for the HD. Normally, boot from the FD.
 	// But, if the HD image file is prefixed with @, then boot from the HD
-	regs8[idx(Reg8::DL)] = ((argc > 3) && (*argv[3] == '@')) ? argv[3]++, 0x80 : 0;
+	regs8[idx(Reg8::DL)] = (hd_path && *hd_path == '@') ? 0x80 : 0;
 
 	// Open BIOS (file id disk[2]), floppy disk image (disk[1]), and hard disk image (disk[0]) if specified
-	for (file_index = 3; file_index;)
 	{
-		const char *path = *++argv;
-		if (!path)
+		const char *paths[3] = {
+			bios_path,
+			fd_path,
+			hd_path ? (hd_path[0] == '@' ? (hd_path + 1) : hd_path) : nullptr,
+		};
+		for (int i = 0; i < 3; ++i)
 		{
-			disk[--file_index] = 0;
-			continue;
+			const char *path = paths[i];
+			const int target_index = 2 - i; // [bios,fd,hd] -> disk[2], disk[1], disk[0]
+			if (!path)
+			{
+				disk[target_index] = 0;
+				continue;
+			}
+			const int fd = platform::open_disk_image(path);
+			disk[target_index] = (fd < 0) ? 0 : fd;
 		}
-
-		int fd = platform::open_disk_image(path);
-		disk[--file_index] = (fd < 0) ? 0 : fd;
 	}
 
 	// Set CX:AX equal to the hard disk image size, if present
@@ -968,6 +1139,11 @@ int main(int argc, char **argv)
 	// Instruction execution loop. Terminates if CS:IP = 0:0
 	for (; opcode_stream = mem + 16 * regs16[idx(Reg16::CS)] + reg_ip, opcode_stream != mem;)
 	{
+		const u32 cur_inst = inst_counter + 1u;
+		const u16 inst_cs = regs16[idx(Reg16::CS)];
+		const u16 inst_ip = reg_ip;
+		const u32 inst_phys = phys20(inst_cs, inst_ip);
+
 		// Set up variables to prepare for decoding an opcode
 		set_opcode(*opcode_stream);
 
@@ -1033,6 +1209,9 @@ int main(int argc, char **argv)
 
 				decode_rm_reg();
 		}
+
+		const u32 inst_len = compute_inst_len();
+		record_instruction(inst_phys, opcode_stream, inst_len);
 
 		// Instruction execution unit
 		switch (static_cast<OpcodeGroup>(xlat_opcode_id))
@@ -1414,6 +1593,12 @@ int main(int argc, char **argv)
 				pc_interrupt(3);
 				break;
 			case OpcodeGroup::INT_IMM8:
+					if ((u8)i_data0 == 0x16)
+					{
+						const u8 ah = regs8[idx(Reg8::AH)];
+						if (ah == 0x00 || ah == 0x01)
+							g_decision_points.push_back(DecisionPoint{cur_inst, inst_cs, inst_ip, inst_phys, ah});
+					}
 				reg_ip += 2;
 				pc_interrupt(i_data0);
 				break;
@@ -1527,6 +1712,9 @@ int main(int argc, char **argv)
 		if (!(++inst_counter % kKeyboardTimerUpdateDelay))
 			int8_asap = 1;
 
+		if (g_max_instructions && inst_counter >= g_max_instructions)
+			break;
+
 #if SNAP_AT
 		if (inst_counter == (u32)SNAP_AT)
 		{
@@ -1610,6 +1798,9 @@ int main(int argc, char **argv)
 		if (int8_asap && !seg_override_en && !rep_override_en && regs8[idx(Flag::IF)] && !regs8[idx(Flag::TF)])
 			pc_interrupt(0xA), int8_asap = 0, poll_active_keyboard();
 	}
+
+	dump_instr_map_to_file(g_dump_instr_path);
+	dump_decisions_to_file(g_dump_decisions_path);
 
 #ifndef NO_GRAPHICS
 	if (sdl_audio_dev)
