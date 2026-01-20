@@ -76,6 +76,34 @@ For 16-bit DOS:
 
 - A natural key is the **physical address**: `phys = (CS << 4) + IP` (20-bit, 1MB address space).
 
+#### 2.2.1 Instruction discovery map (what to record)
+
+Coverage tells you *where* you executed. For your actual goal ("find assembly instructions"), also record *what bytes were executed at each address*.
+
+At minimum, on each executed instruction:
+
+- `phys`: physical address of the instruction start
+- `len`: decoded instruction length (you already know this from the emulator’s decoder)
+- `bytes[len]`: the raw instruction bytes as fetched from memory
+- `count`: how many times you executed this `phys`
+
+Data structure options:
+
+- **Fixed array (recommended first)**: `InstructionInfo info[1<<20]`
+   - Pros: fastest, simplest, deterministic indexing
+   - Cons: fixed RAM cost, but 1MB–a few MB is totally fine
+- **Hash map (sparse)**: `unordered_map<uint32_t, InstructionInfo>` keyed by `phys`
+   - Pros: smaller memory if you touch very few addresses
+   - Cons: slower, more complex, less cache-friendly
+
+Self-modifying/overlay caveat:
+
+- If you ever observe different `bytes` at the same `phys`, keep a small vector of “variants” for that address (or just keep the first + most recent). This is rare for many DOS games, but it’s worth not silently lying.
+
+You can disassemble later:
+
+- Either integrate a tiny 8086 disassembler for a `bytes -> mnemonic` string, or store raw bytes + length and disassemble offline. For discovery/corpus guidance, raw bytes are already enough.
+
 ### 2.3 Corpus
 
 The corpus is a set of input sequences that produced interesting new behavior (new coverage, deep progress, etc.).
@@ -386,6 +414,70 @@ A practical schedule:
 - 70% small mutations
 - 25% medium
 - 5% large
+
+### 9.4 Target: Gorilla.exe (key set + safety)
+
+For Gorilla.exe, the useful input alphabet is very small, which is great for exploration.
+
+Gameplay input:
+
+- `0`–`9` — typing numbers for angle/velocity
+- `Backspace` — correct typing
+- `Enter` — submit angle / submit velocity
+
+Game flow:
+
+- `Y` — play again (when prompted)
+- `N` — quit (when prompted)
+
+Environment / emulator (avoid using as exploration inputs):
+
+- `Alt+Enter` — fullscreen toggle
+
+Safety policy (recommended for the explorer):
+
+- Never generate `N` (hard-ban). Quitting stops exploration and usually loses state.
+- Never generate `Alt` combos (`Alt+Enter`, etc.). They are emulator/UI actions, not game semantics.
+- Only allow `Y` after you have evidence you are at an end-of-round prompt (see decision-point exploration below). If you can’t detect prompts yet, allow `Y` but rate-limit it (e.g., only once per run) to avoid getting stuck in replay loops.
+
+If you later add prompt detection, do it with emulator-level signals first (cheaper and more deterministic than screen scraping):
+
+- Detect “game is asking for input” via INT 16h AH=00h (blocking read) and/or tight polling loops around AH=01h.
+- Optionally detect program phase by hashing a small slice of RAM (e.g., a few KB around known data segments) at those decision points.
+
+### 9.5 Converting fuzzing into pathfinding (decision-point graph)
+
+Pure timed key sequences work, but for keyboard-driven games you can get a much more directed search if you treat each “waiting for key” as a planning step.
+
+1) Define decision points
+
+- A decision point is when the program requests a key (e.g., INT 16h AH=00h), or when you detect it is polling for keys (repeating a small PC loop with INT 16h AH=01h).
+- Between decision points, run the emulator freely (no input injection) until the next decision point, an instruction budget limit, or a stop condition.
+
+2) Build an implicit state graph
+
+- Node = a checkpointable machine state at a decision point.
+- Edge = apply exactly one key event from the Gorilla key alphabet, then run until the next decision point.
+- Annotate each edge with: coverage gained, target-region gained, and any “bad outcomes” (exit, hang, loops).
+
+3) Choose a search strategy (best-first works well)
+
+- Maintain a priority queue of nodes to expand.
+- Priority heuristic example:
+   - `score = 10*region_gain + 1*global_gain + 0.1*depth - penalties`
+   - Penalties for: repeated PCs, long time with no new coverage, returning to already-seen state hashes.
+
+4) State hashing and de-duplication
+
+- Hash only what you need to avoid exploding memory.
+- Practical starting point: at decision points hash `(CS:IP, SS:SP, flags, a few KB of RAM near the keyboard/game state)`.
+- Keep a map `best_score_by_state_hash` and only re-expand a state if you improved its best known score.
+
+5) Why this helps instruction discovery
+
+- It naturally produces a corpus of “meaningful” inputs (angle digits, backspaces, enter presses) at the times the program actually consumes input.
+- It makes it easy to store checkpoints exactly where they matter: right before the game asks for angle/velocity.
+- It lets you explore deeper prompts (game start, next round, etc.) without long, brittle timed scripts.
 
 ---
 
