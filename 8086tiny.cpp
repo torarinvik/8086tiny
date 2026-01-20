@@ -598,6 +598,10 @@ static u32 g_explore_warmup_inst = 2000000; // initial warmup budget; may auto-e
 static bool g_explore_warmup_inst_user_set = false;
 static std::string g_explore_tty_tail;
 
+static const char *g_explore_best_keys_path = nullptr;
+static u32 g_explore_save_every = 200; // iterations; 0 disables periodic save
+static u32 g_explore_dump_every = 0;   // iterations; 0 disables periodic dump
+
 static volatile std::sig_atomic_t g_host_stop_signal = 0;
 
 static void on_host_signal(int sig)
@@ -674,6 +678,11 @@ static bool try_parse_gorilla_ascii_token(const std::string &token, u8 &out_asci
 		out_ascii = 0x08;
 		return true;
 	}
+	if (tok == "SPACE")
+	{
+		out_ascii = (u8)' ';
+		return true;
+	}
 	if (tok == "Y")
 	{
 		out_ascii = (u8)'Y';
@@ -681,6 +690,57 @@ static bool try_parse_gorilla_ascii_token(const std::string &token, u8 &out_asci
 	}
 
 	return false;
+}
+
+static std::string token_from_ascii(u8 c)
+{
+	if (c == 0x0D)
+		return "ENTER";
+	if (c == 0x08)
+		return "BS";
+	if (c == (u8)' ')
+		return "SPACE";
+	if ((c >= (u8)'0' && c <= (u8)'9') || (c >= (u8)'A' && c <= (u8)'Z') || c == (u8)':' || c == (u8)'\\' || c == (u8)'.' || c == (u8)'_')
+		return std::string(1, (char)c);
+	// Fallback: hex byte.
+	char buf[8] = {0};
+	std::snprintf(buf, sizeof(buf), "0x%02X", (unsigned)c);
+	return std::string(buf);
+}
+
+static bool write_text_file_atomic(const char *path, const std::string &contents)
+{
+	if (!path || !*path)
+		return false;
+	const std::string tmp = std::string(path) + ".tmp";
+	{
+		std::ofstream out(tmp, std::ios::binary);
+		if (!out)
+			return false;
+		out.write(contents.data(), (std::streamsize)contents.size());
+		if (!out)
+			return false;
+	}
+	if (std::rename(tmp.c_str(), path) != 0)
+	{
+		std::remove(tmp.c_str());
+		return false;
+	}
+	return true;
+}
+
+static bool save_keys_file(const char *path, const std::vector<u8> &ascii)
+{
+	std::string line;
+	line.reserve(ascii.size() * 2u + 16u);
+	for (std::size_t i = 0; i < ascii.size(); ++i)
+	{
+		if (i)
+			line.push_back(',');
+		line += token_from_ascii(ascii[i]);
+	}
+	line.push_back('\n');
+	return write_text_file_atomic(path, line);
 }
 
 static inline void explore_observe_tty_char(u8 ch)
@@ -1476,6 +1536,40 @@ int main(int argc, char **argv)
 			g_explore_mode = true;
 			continue;
 		}
+		if (!std::strcmp(arg, "--explore-save-best") && (i + 1) < argc)
+		{
+			g_explore_best_keys_path = argv[++i];
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-save-best=", 19))
+		{
+			g_explore_best_keys_path = arg + 19;
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-save-every") && (i + 1) < argc)
+		{
+			if (!parse_u32_flag("--explore-save-every", argv[++i], g_explore_save_every))
+				return 2;
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-save-every=", 20))
+		{
+			if (!parse_u32_flag("--explore-save-every", arg + 20, g_explore_save_every))
+				return 2;
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-dump-every") && (i + 1) < argc)
+		{
+			if (!parse_u32_flag("--explore-dump-every", argv[++i], g_explore_dump_every))
+				return 2;
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-dump-every=", 20))
+		{
+			if (!parse_u32_flag("--explore-dump-every", arg + 20, g_explore_dump_every))
+				return 2;
+			continue;
+		}
 		if (!std::strcmp(arg, "--quiet"))
 		{
 			g_quiet_output = true;
@@ -1623,6 +1717,8 @@ int main(int argc, char **argv)
 			g_dump_instr_path = "instr.csv";
 		if (!g_dump_decisions_path)
 			g_dump_decisions_path = "decisions.csv";
+		if (!g_explore_best_keys_path)
+			g_explore_best_keys_path = "best_keys.txt";
 		// Exploration is headless/high-volume; suppress BIOS PUTCHAR output unless the user opted in.
 		if (!g_quiet_output_user_set)
 			g_quiet_output = true;
@@ -1635,6 +1731,7 @@ int main(int argc, char **argv)
 			"          [--quiet|--loud]\n"
 			"          [--debug-diskio]\n"
 			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N --explore-warmup-inst N]\n"
+			"          [--explore-save-best path.txt --explore-save-every N --explore-dump-every N]\n"
 			"          bios fd.img [hd.img]\n",
 			argv[0]);
 		return 1;
@@ -2590,6 +2687,11 @@ int main(int argc, char **argv)
 		{
 			explore_best_gain = gain;
 			explore_best_seq = explore_current;
+			if (g_explore_best_keys_path && !explore_best_seq.empty())
+			{
+				if (!save_keys_file(g_explore_best_keys_path, explore_best_seq))
+					std::fprintf(stderr, "Warning: failed to save best keys to %s\n", g_explore_best_keys_path);
+			}
 		}
 
 		if (gain > 0)
@@ -2606,6 +2708,18 @@ int main(int argc, char **argv)
 				(unsigned)explore_corpus.size(),
 				(unsigned)gain,
 				(unsigned)explore_best_gain);
+
+		// Periodic persistence to survive long runs / interrupts.
+		if (g_explore_save_every && (explore_iter % g_explore_save_every) == 0u)
+		{
+			if (g_explore_best_keys_path && !explore_best_seq.empty())
+				(void)save_keys_file(g_explore_best_keys_path, explore_best_seq);
+		}
+		if (g_explore_dump_every && (explore_iter % g_explore_dump_every) == 0u)
+		{
+			dump_instr_map_to_file(g_dump_instr_path);
+			dump_decisions_to_file(g_dump_decisions_path);
+		}
 
 		++explore_iter;
 		if (explore_iter < g_explore_iters)
@@ -2627,6 +2741,8 @@ int main(int argc, char **argv)
 			(unsigned)explore_iter,
 			(unsigned)explore_corpus.size(),
 			(unsigned)explore_best_gain);
+		if (g_explore_best_keys_path && !explore_best_seq.empty())
+			(void)save_keys_file(g_explore_best_keys_path, explore_best_seq);
 	}
 
 	dump_instr_map_to_file(g_dump_instr_path);
