@@ -931,15 +931,16 @@ int main(int argc, char **argv)
 					MEM_OP(op_from_addr, =, op_to_addr);
 					break;
 				case 12: // ROL|ROR|RCL|RCR|SHL|SHR|???|SAR reg/mem, 1/CL/imm (80186)
-					scratch2_uint = sign_of(mem[rm_addr]),
-				scratch_uint = extra ? // xxx reg/mem, imm
-					++reg_ip,
-					(char)i_data1
-				: // xxx reg/mem, CL
-					i_d
-						? 31 & regs8[idx(Reg8::CL)]
-				: // xxx reg/mem, 1
-					1;
+					scratch2_uint = sign_of(mem[rm_addr]);
+					if (extra) // xxx reg/mem, imm
+					{
+						++reg_ip;
+						scratch_uint = (char)i_data1;
+					}
+					else if (i_d) // xxx reg/mem, CL
+						scratch_uint = 31 & regs8[idx(Reg8::CL)];
+					else // xxx reg/mem, 1
+						scratch_uint = 1;
 				if (scratch_uint)
 				{
 					if (i_reg < 4) // Rotate operations
