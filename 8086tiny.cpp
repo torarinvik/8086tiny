@@ -51,6 +51,7 @@ constexpr std::underlying_type_t<E> to_underlying(E e) noexcept
 	return static_cast<std::underlying_type_t<E>>(e);
 }
 
+
 // 8-bit register decodes
 enum class Reg8 : int
 {
@@ -119,6 +120,199 @@ enum class BiosTable : int
 };
 
 constexpr int idx(BiosTable t) noexcept { return to_underlying(t); }
+
+// Opcode groups for the main execution switch.
+// NOTE: The underlying values MUST match the BIOS XLAT table output (0..48).
+enum class OpcodeGroup : u8
+{
+	COND_JUMP,
+	MOV_REG_IMM,
+	INC_DEC_REG16,
+	PUSH_REG16,
+	POP_REG16,
+	GRP_INC_DEC_JMP_CALL_PUSH,
+	GRP_TEST_NOT_NEG_MUL_DIV,
+	ALU_AL_AX_IMM,
+	ALU_REG_IMM,
+	ALU_REG_RM,
+	MOV_SREG_POP_LEA,
+	MOV_AL_AX_LOC,
+	GRP_BITWISE,
+	GRP_LOOP,
+	JMP_CALL_SHORT_NEAR,
+	TEST_REG_RM,
+	XCHG_AX_REG16,
+	GRP_MOVS_STOS_LODS,
+	GRP_CMPS_SCAS,
+	RET_RETF_IRET,
+	MOV_RM_IMM,
+	IN_AL_AX,
+	OUT_AL_AX,
+	REPXX,
+	NOP_XCHG_REG_RM,
+	PUSH_REG,
+	POP_REG,
+	SEGMENT_OVERRIDE,
+	DAA_DAS,
+	AAA_AAS,
+	CBW,
+	CWD,
+	CALL_FAR_IMM,
+	PUSHF,
+	POPF,
+	SAHF,
+	LAHF,
+	LES_LDS_REG_RM,
+	INT_3,
+	INT_IMM8,
+	INTO,
+	AAM,
+	AAD,
+	SALC,
+	XLAT,
+	CMC,
+	CLC_STC_CLI_STI_CLD_STD,
+	TEST_AL_AX_IMM,
+	EMULATOR_SPECIFIC
+};
+
+static_assert(to_underlying(OpcodeGroup::COND_JUMP) == 0);
+// Guardrails: BIOS XLAT translates raw opcodes into an OpcodeGroup id; these asserts ensure
+// the enum stays in sync with that 0..48 table mapping even if items are reordered/inserted.
+static_assert(to_underlying(OpcodeGroup::ALU_REG_RM) == 9);
+static_assert(to_underlying(OpcodeGroup::GRP_BITWISE) == 12);
+static_assert(to_underlying(OpcodeGroup::REPXX) == 23);
+static_assert(to_underlying(OpcodeGroup::INT_IMM8) == 39);
+static_assert(to_underlying(OpcodeGroup::EMULATOR_SPECIFIC) == 48);
+
+// ALU operations (for groups 7, 8, 9)
+enum class AluOp : int
+{
+	ADD = 0,
+	OR = 1,
+	ADC = 2,
+	SBB = 3,
+	AND = 4,
+	SUB = 5,
+	XOR = 6,
+	CMP = 7,
+	MOV = 8
+};
+
+// Group 5 operations (INC, DEC, JMP, CALL, PUSH)
+enum class Group5Op : int
+{
+	INC = 0,
+	DEC = 1,
+	CALL_NEAR = 2,
+	CALL_FAR = 3,
+	JMP_NEAR = 4,
+	JMP_FAR = 5,
+	PUSH = 6
+};
+
+// Group 6 operations (TEST, NOT, NEG, MUL, IMUL, DIV, IDIV)
+enum class Group6Op : int
+{
+	TEST = 0,
+	NOT = 2,
+	NEG = 3,
+	MUL = 4,
+	IMUL = 5,
+	DIV = 6,
+	IDIV = 7
+};
+
+// Bitwise operations (Group 12)
+enum class BitwiseOp : int
+{
+	ROL = 0,
+	ROR = 1,
+	RCL = 2,
+	RCR = 3,
+	SHL = 4,
+	SHR = 5,
+	SAR = 7
+};
+
+// Loop operations (Group 13)
+enum class LoopOp : int
+{
+	LOOPNZ = 0,
+	LOOPZ = 1,
+	JCXZ = 3
+};
+
+// Emulator-specific operations (Group 48)
+enum class EmulatorOp : int
+{
+	PUTCHAR_AL = 0,
+	GET_RTC = 1,
+	DISK_READ = 2,
+	DISK_WRITE = 3
+};
+
+enum class BitSize : u8
+{
+	Bit8 = 8,
+	Bit16 = 16
+};
+
+enum class OpDirection : u8
+{
+	ToRM = 0,
+	FromRM = 1,
+	None = 2
+};
+
+enum class OpForm : u8
+{
+	None = 0,
+	RegRm = 1,
+	ImmToRm = 2,
+	AccImm = 3
+};
+
+struct OpView
+{
+	BitSize size;
+	OpForm form;
+	OpDirection direction;
+};
+
+constexpr BitSize bit_size_from_w(u8 w) noexcept
+{
+	return w ? BitSize::Bit16 : BitSize::Bit8;
+}
+
+constexpr OpDirection op_direction_from_d(u8 d) noexcept
+{
+	return d ? OpDirection::FromRM : OpDirection::ToRM;
+}
+
+constexpr OpView op_view_for(OpcodeGroup group, u8 w, u8 d) noexcept
+{
+	const BitSize size = bit_size_from_w(w);
+	switch (group)
+	{
+		case OpcodeGroup::ALU_REG_RM:
+			return OpView{size, OpForm::RegRm, op_direction_from_d(d)};
+		case OpcodeGroup::ALU_REG_IMM:
+			return OpView{size, OpForm::ImmToRm, OpDirection::None};
+		case OpcodeGroup::ALU_AL_AX_IMM:
+			return OpView{size, OpForm::AccImm, OpDirection::None};
+		default:
+			return OpView{size, OpForm::None, OpDirection::None};
+	}
+}
+
+constexpr int idx(OpcodeGroup g) noexcept { return to_underlying(g); }
+constexpr int idx(AluOp o) noexcept { return to_underlying(o); }
+constexpr int idx(Group5Op o) noexcept { return to_underlying(o); }
+constexpr int idx(Group6Op o) noexcept { return to_underlying(o); }
+constexpr int idx(BitwiseOp o) noexcept { return to_underlying(o); }
+constexpr int idx(LoopOp o) noexcept { return to_underlying(o); }
+constexpr int idx(EmulatorOp o) noexcept { return to_underlying(o); }
 
 // Bitfields for TABLE_STD_FLAGS values
 constexpr u32 FLAGS_UPDATE_SZP = 1;
@@ -370,6 +564,11 @@ static inline u32 get_reg_addr(u32 reg_id) noexcept
 static inline u32 top_bit() noexcept
 {
 	return 8u * (u32)(i_w + 1u);
+}
+
+static inline u32 top_bit(BitSize size) noexcept
+{
+	return (u32)size;
 }
 
 template <typename A>
@@ -787,39 +986,39 @@ int main(int argc, char **argv)
 		}
 
 		// Instruction execution unit
-		switch (xlat_opcode_id)
+		switch (static_cast<OpcodeGroup>(xlat_opcode_id))
 		{
-			case 0: // Conditional jump (JAE, JNAE, etc.)
+			case OpcodeGroup::COND_JUMP:
 				// i_w is the invert flag, e.g. i_w == 1 means JNAE, whereas i_w == 0 means JAE 
 				scratch_uchar = raw_opcode_id / 2 & 7;
 				reg_ip += (char)i_data0 * (i_w ^ (regs8[bios_table_lookup[idx(BiosTable::COND_JUMP_DECODE_A)][scratch_uchar]] || regs8[bios_table_lookup[idx(BiosTable::COND_JUMP_DECODE_B)][scratch_uchar]] || regs8[bios_table_lookup[idx(BiosTable::COND_JUMP_DECODE_C)][scratch_uchar]] ^ regs8[bios_table_lookup[idx(BiosTable::COND_JUMP_DECODE_D)][scratch_uchar]]));
 				break;
-			case 1: // MOV reg, imm
+			case OpcodeGroup::MOV_REG_IMM:
 				i_w = !!(raw_opcode_id & 8);
 				R_M_OP(mem[get_reg_addr(i_reg4bit)], =, i_data0);
 				break;
-			case 3: // PUSH regs16
+			case OpcodeGroup::PUSH_REG16:
 				r_m_push(regs16[i_reg4bit]);
 				break;
-			case 4: // POP regs16
+			case OpcodeGroup::POP_REG16:
 				r_m_pop(regs16[i_reg4bit]);
 				break;
-			case 2: // INC|DEC regs16
+			case OpcodeGroup::INC_DEC_REG16:
 				i_w = 1;
 				i_d = 0;
 				i_reg = i_reg4bit;
 				decode_rm_reg();
 				i_reg = extra;
 					[[fallthrough]];
-			case 5: // INC|DEC|JMP|CALL|PUSH
-				if (i_reg < 2) // INC|DEC
+			case OpcodeGroup::GRP_INC_DEC_JMP_CALL_PUSH:
+				if (i_reg < 2) // INC | DEC
 					MEM_OP(op_from_addr, += 1 - 2 * i_reg +, REGS_BASE + 2 * idx(Reg16::ZERO)),
 					op_source = 1,
 					set_AF_OF_arith(),
 					set_OF(op_dest + 1 - i_reg == (1u << (top_bit() - 1u))),
-					(xlat_opcode_id == 5) && (set_opcode(0x10), 0); // Decode like ADC
-				else if (i_reg != 6) // JMP|CALL
-					i_reg - 3 || r_m_push(regs16[idx(Reg16::CS)]), // CALL (far)
+					(xlat_opcode_id == idx(OpcodeGroup::GRP_INC_DEC_JMP_CALL_PUSH)) && (set_opcode(0x10), 0); // Decode like ADC
+				else if (i_reg != idx(Group5Op::PUSH)) // JMP | CALL
+					i_reg - idx(Group5Op::CALL_FAR) || r_m_push(regs16[idx(Reg16::CS)]), // CALL (far)
 					i_reg & 2 && r_m_push(reg_ip + 2 + i_mod*(i_mod != 3) + 2*(!i_mod && i_rm == 6)), // CALL (near or far)
 					i_reg & 1 && (regs16[idx(Reg16::CS)] = ref<short>(mem[op_from_addr + 2])), // JMP|CALL (far)
 					R_M_OP(reg_ip, =, mem[op_from_addr]),
@@ -827,89 +1026,89 @@ int main(int argc, char **argv)
 				else // PUSH
 						r_m_push(mem[rm_addr]);
 					break;
-				case 6: // TEST r/m, imm16 / NOT|NEG|MUL|IMUL|DIV|IDIV reg
+				case OpcodeGroup::GRP_TEST_NOT_NEG_MUL_DIV:
 				op_to_addr = op_from_addr;
 
-				switch (i_reg)
+				switch (static_cast<Group6Op>(i_reg))
 				{
-						case 0: // TEST
+						case Group6Op::TEST:
 						set_opcode(0x20); // Decode like AND
 						reg_ip += i_w + 1;
 							R_M_OP(mem[op_to_addr], &, i_data2);
 							break;
-						case 2: // NOT
+						case Group6Op::NOT:
 							OP(=~);
 							break;
-						case 3: // NEG
+						case Group6Op::NEG:
 						OP(=-);
 						op_dest = 0;
 						set_opcode(0x28); // Decode like SUB
 							set_CF(op_result > op_dest);
 							break;
-						case 4: // MUL
+						case Group6Op::MUL:
 							i_w ? mul_op<unsigned short>(regs16) : mul_op<unsigned char>(regs8);
 							break;
-						case 5: // IMUL
+						case Group6Op::IMUL:
 							i_w ? mul_op<short>(regs16) : mul_op<char>(regs8);
 							break;
-						case 6: // DIV
+						case Group6Op::DIV:
 							i_w ? div_op<unsigned short, unsigned>(regs16) : div_op<unsigned char, unsigned short>(regs8);
 							break;
-						case 7: // IDIV
+						case Group6Op::IDIV:
 							i_w ? div_op<short, int>(regs16) : div_op<char, short>(regs8);
 							break;
 				}
 					break;
-				case 7: // ADD|OR|ADC|SBB|AND|SUB|XOR|CMP AL/AX, immed
+				case OpcodeGroup::ALU_AL_AX_IMM:
 					rm_addr = REGS_BASE;
 					i_data2 = i_data0;
 					i_mod = 3;
 					i_reg = extra;
 					reg_ip--;
 					[[fallthrough]];
-				case 8: // ADD|OR|ADC|SBB|AND|SUB|XOR|CMP reg, immed
+				case OpcodeGroup::ALU_REG_IMM:
 				op_to_addr = rm_addr;
 				regs16[idx(Reg16::SCRATCH)] = (i_d |= !i_w) ? (char)i_data2 : i_data2;
 				op_from_addr = REGS_BASE + 2 * idx(Reg16::SCRATCH);
 				reg_ip += !i_d + 1;
 				set_opcode(0x08 * (extra = i_reg));
 					[[fallthrough]];
-				case 9: // ADD|OR|ADC|SBB|AND|SUB|XOR|CMP|MOV reg, r/m
-				switch (extra)
+				case OpcodeGroup::ALU_REG_RM:
+				switch (static_cast<AluOp>(extra))
 				{
-						case 0: // ADD
+						case AluOp::ADD:
 							OP(+=),
 							set_CF(op_result < op_dest);
 							break;
-						case 1: // OR
+						case AluOp::OR:
 							OP(|=);
 							break;
-						case 2: // ADC
+						case AluOp::ADC:
 							adc_op();
 							break;
-						case 3: // SBB
+						case AluOp::SBB:
 							sbb_op();
 							break;
-						case 4: // AND
+						case AluOp::AND:
 							OP(&=);
 							break;
-						case 5: // SUB
+						case AluOp::SUB:
 							OP(-=),
 							set_CF(op_result > op_dest);
 							break;
-						case 6: // XOR
+						case AluOp::XOR:
 							OP(^=);
 							break;
-						case 7: // CMP
+						case AluOp::CMP:
 							OP(-),
 							set_CF(op_result > op_dest);
 							break;
-						case 8: // MOV
+						case AluOp::MOV:
 							OP(=);
 							break;
 				}
 					break;
-				case 10: // MOV sreg, r/m | POP r/m | LEA reg, r/m
+				case OpcodeGroup::MOV_SREG_POP_LEA:
 				if (!i_w) // MOV
 					i_w = 1,
 					i_reg += 8,
@@ -923,14 +1122,18 @@ int main(int argc, char **argv)
 				else // POP
 						r_m_pop(mem[rm_addr]);
 					break;
-				case 11: // MOV AL/AX, [loc]
+				case OpcodeGroup::MOV_AL_AX_LOC:
 				i_mod = i_reg = 0;
 				i_rm = 6;
 				i_data1 = i_data0;
 				decode_rm_reg();
 					MEM_OP(op_from_addr, =, op_to_addr);
 					break;
-				case 12: // ROL|ROR|RCL|RCR|SHL|SHR|???|SAR reg/mem, 1/CL/imm (80186)
+				case OpcodeGroup::GRP_BITWISE:
+				{
+					const OpView opv = op_view_for(OpcodeGroup::GRP_BITWISE, i_w, i_d);
+					const u32 bits = top_bit(opv.size);
+
 					scratch2_uint = sign_of(mem[rm_addr]);
 					if (extra) // xxx reg/mem, imm
 					{
@@ -944,7 +1147,7 @@ int main(int argc, char **argv)
 				if (scratch_uint)
 				{
 					if (i_reg < 4) // Rotate operations
-						scratch_uint %= i_reg / 2 + top_bit(),
+						scratch_uint %= i_reg / 2 + bits,
 						R_M_OP(scratch2_uint, =, mem[rm_addr]);
 					if (i_reg & 1) // Rotate/shift right operations
 						R_M_OP(mem[rm_addr], >>=, scratch_uint);
@@ -956,51 +1159,54 @@ int main(int argc, char **argv)
 						set_CF(op_dest >> (scratch_uint - 1) & 1);
 				}
 
-					switch (i_reg)
+					switch (static_cast<BitwiseOp>(i_reg))
 					{
-						case 0: // ROL
-							R_M_OP(mem[rm_addr], += , scratch2_uint >> (top_bit() - scratch_uint));
+						case BitwiseOp::ROL:
+							R_M_OP(mem[rm_addr], += , scratch2_uint >> (bits - scratch_uint));
 							set_OF(sign_of(op_result) ^ set_CF(op_result & 1));
 							break;
-						case 1: // ROR
+						case BitwiseOp::ROR:
 							scratch2_uint &= (1 << scratch_uint) - 1;
-							R_M_OP(mem[rm_addr], += , scratch2_uint << (top_bit() - scratch_uint));
+							R_M_OP(mem[rm_addr], += , scratch2_uint << (bits - scratch_uint));
 							set_OF(sign_of(op_result * 2) ^ set_CF(sign_of(op_result)));
 							break;
-						case 2: // RCL
-							R_M_OP(mem[rm_addr], += (regs8[idx(Flag::CF)] << (scratch_uint - 1)) + , scratch2_uint >> (1u + top_bit() - scratch_uint));
-							set_OF(sign_of(op_result) ^ set_CF(scratch2_uint & (1u << (top_bit() - scratch_uint))));
+						case BitwiseOp::RCL:
+							R_M_OP(mem[rm_addr], += (regs8[idx(Flag::CF)] << (scratch_uint - 1)) + , scratch2_uint >> (1u + bits - scratch_uint));
+							set_OF(sign_of(op_result) ^ set_CF(scratch2_uint & (1u << (bits - scratch_uint))));
 							break;
-						case 3: // RCR
-							R_M_OP(mem[rm_addr], += (regs8[idx(Flag::CF)] << (top_bit() - scratch_uint)) + , scratch2_uint << (1u + top_bit() - scratch_uint));
+						case BitwiseOp::RCR:
+							R_M_OP(mem[rm_addr], += (regs8[idx(Flag::CF)] << (bits - scratch_uint)) + , scratch2_uint << (1u + bits - scratch_uint));
 							set_CF(scratch2_uint & 1 << (scratch_uint - 1));
 							set_OF(sign_of(op_result) ^ sign_of(op_result * 2));
 							break;
-						case 4: // SHL
+						case BitwiseOp::SHL:
 							set_OF(sign_of(op_result) ^ set_CF(sign_of(op_dest << (scratch_uint - 1))));
 							break;
-						case 5: // SHR
+						case BitwiseOp::SHR:
 							set_OF(sign_of(op_dest));
 							break;
-						case 7: // SAR
-							scratch_uint < top_bit() || set_CF(scratch2_uint);
+						case BitwiseOp::SAR:
+							scratch_uint < bits || set_CF(scratch2_uint);
 							set_OF(0);
-							R_M_OP(mem[rm_addr], +=, scratch2_uint *= ~(((1u << top_bit()) - 1u) >> scratch_uint));
+							R_M_OP(mem[rm_addr], +=, scratch2_uint *= ~(((1u << bits) - 1u) >> scratch_uint));
+							break;
+						default:
 							break;
 					}
 					break;
-				case 13: // LOOPxx|JCZX
+				}
+				case OpcodeGroup::GRP_LOOP:
 				scratch_uint = !!--regs16[idx(Reg16::CX)];
 
-				switch(i_reg4bit)
+				switch (static_cast<LoopOp>(i_reg4bit))
 				{
-					case 0: // LOOPNZ
+					case LoopOp::LOOPNZ:
 						scratch_uint &= !regs8[idx(Flag::ZF)];
 						break;
-					case 1: // LOOPZ
+					case LoopOp::LOOPZ:
 						scratch_uint &= regs8[idx(Flag::ZF)];
 						break;
-					case 3: // JCXXZ
+					case LoopOp::JCXZ:
 						scratch_uint = !++regs16[idx(Reg16::CX)];
 						break;
 					default:
@@ -1008,7 +1214,7 @@ int main(int argc, char **argv)
 				}
 				reg_ip += scratch_uint*(char)i_data0;
 				break;
-			case 14: // JMP | CALL short/near
+			case OpcodeGroup::JMP_CALL_SHORT_NEAR:
 				reg_ip += 3 - i_d;
 				if (!i_w)
 				{
@@ -1020,21 +1226,21 @@ int main(int argc, char **argv)
 				}
 				reg_ip += i_d && i_w ? (char)i_data0 : i_data0;
 				break;
-			case 15: // TEST reg, r/m
+			case OpcodeGroup::TEST_REG_RM:
 				MEM_OP(op_from_addr, &, op_to_addr);
 				break;
-			case 16: // XCHG AX, regs16
+			case OpcodeGroup::XCHG_AX_REG16:
 				i_w = 1;
 				op_to_addr = REGS_BASE;
 				op_from_addr = get_reg_addr(i_reg4bit);
 				[[fallthrough]];
-			case 24: // NOP|XCHG reg, r/m
+			case OpcodeGroup::NOP_XCHG_REG_RM:
 				if (op_to_addr != op_from_addr)
 					OP(^=),
 					MEM_OP(op_from_addr, ^=, op_to_addr),
 					OP(^=);
 				break;
-			case 17: // MOVSx (extra=0)|STOSx (extra=1)|LODSx (extra=2)
+			case OpcodeGroup::GRP_MOVS_STOS_LODS:
 				scratch2_uint = seg_override_en ? seg_override : (u32)idx(Reg16::DS);
 
 				for (scratch_uint = rep_override_en ? regs16[idx(Reg16::CX)] : 1; scratch_uint; scratch_uint--)
@@ -1047,7 +1253,7 @@ int main(int argc, char **argv)
 				if (rep_override_en)
 					regs16[idx(Reg16::CX)] = 0;
 				break;
-			case 18: // CMPSx (extra=0)|SCASx (extra=1)
+			case OpcodeGroup::GRP_CMPS_SCAS:
 				scratch2_uint = seg_override_en ? seg_override : (u32)idx(Reg16::DS);
 
 				if ((scratch_uint = rep_override_en ? regs16[idx(Reg16::CX)] : 1))
@@ -1063,7 +1269,7 @@ int main(int argc, char **argv)
 					set_CF(op_result > op_dest);
 				}
 				break;
-			case 19: // RET|RETF|IRET
+			case OpcodeGroup::RET_RETF_IRET:
 				i_d = i_w;
 				r_m_pop(reg_ip);
 				if (extra) // IRET|RETF|RETF imm16
@@ -1073,10 +1279,10 @@ int main(int argc, char **argv)
 				else if (!i_d) // RET|RETF imm16
 					regs16[idx(Reg16::SP)] += i_data0;
 				break;
-			case 20: // MOV r/m, immed
+			case OpcodeGroup::MOV_RM_IMM:
 				R_M_OP(mem[op_from_addr], =, i_data2);
 				break;
-			case 21: // IN AL/AX, DX/imm8
+			case OpcodeGroup::IN_AL_AX:
 				io_ports[0x20] = 0; // PIC EOI
 				io_ports[0x42] = --io_ports[0x40]; // PIT channel 0/2 read placeholder
 				io_ports[0x3DA] ^= 9; // CGA refresh
@@ -1085,7 +1291,7 @@ int main(int argc, char **argv)
 				scratch_uint == 0x3D5 && (io_ports[0x3D4] >> 1 == 7) && (io_ports[0x3D5] = ((mem[0x49E]*80 + mem[0x49D] + ref<short>(mem[0x4AD])) & (io_ports[0x3D4] & 1 ? 0xFF : 0xFF00)) >> (io_ports[0x3D4] & 1 ? 0 : 8)); // CRT cursor position
 				R_M_OP(regs8[idx(Reg8::AL)], =, io_ports[scratch_uint]);
 				break;
-			case 22: // OUT DX/imm8, AL/AX
+			case OpcodeGroup::OUT_AL_AX:
 				scratch_uint = extra ? regs16[idx(Reg16::DX)] : (unsigned char)i_data0;
 				R_M_OP(io_ports[scratch_uint], =, regs8[idx(Reg8::AL)]);
 				scratch_uint == 0x61 && (io_hi_lo = 0, spkr_en |= regs8[idx(Reg8::AL)] & 3); // Speaker control
@@ -1098,114 +1304,114 @@ int main(int argc, char **argv)
 				scratch_uint == 0x3B5 && io_ports[0x3B4] == 1 && (GRAPHICS_X = regs8[idx(Reg8::AL)] * 16); // Hercules resolution reprogramming. Defaults are set in the BIOS
 				scratch_uint == 0x3B5 && io_ports[0x3B4] == 6 && (GRAPHICS_Y = regs8[idx(Reg8::AL)] * 4);
 				break;
-			case 23: // REPxx
+			case OpcodeGroup::REPXX:
 				rep_override_en = 2;
 				rep_mode = i_w;
 				seg_override_en && seg_override_en++;
 				break;
-			case 25: // PUSH reg
+			case OpcodeGroup::PUSH_REG:
 				r_m_push(regs16[extra]);
 				break;
-			case 26: // POP reg
+			case OpcodeGroup::POP_REG:
 				r_m_pop(regs16[extra]);
 				break;
-			case 27: // xS: segment overrides
+			case OpcodeGroup::SEGMENT_OVERRIDE:
 				seg_override_en = 2;
 				seg_override = extra;
 				rep_override_en && rep_override_en++;
 				break;
-			case 28: // DAA/DAS
+			case OpcodeGroup::DAA_DAS:
 				i_w = 0;
 				extra ? das() : daa(); // extra = 0 for DAA, 1 for DAS
 				break;
-			case 29: // AAA/AAS
+			case OpcodeGroup::AAA_AAS:
 				op_result = AAA_AAS(extra - 1);
 				break;
-			case 30: // CBW
+			case OpcodeGroup::CBW:
 				regs8[idx(Reg8::AH)] = -sign_of(regs8[idx(Reg8::AL)]);
 				break;
-			case 31: // CWD
+			case OpcodeGroup::CWD:
 				regs16[idx(Reg16::DX)] = -sign_of(regs16[idx(Reg16::AX)]);
 				break;
-			case 32: // CALL FAR imm16:imm16
+			case OpcodeGroup::CALL_FAR_IMM:
 				r_m_push(regs16[idx(Reg16::CS)]);
 				r_m_push(reg_ip + 5);
 				regs16[idx(Reg16::CS)] = i_data2;
 				reg_ip = i_data0;
 				break;
-			case 33: // PUSHF
+			case OpcodeGroup::PUSHF:
 				make_flags();
 				r_m_push(scratch_uint);
 				break;
-			case 34: // POPF
+			case OpcodeGroup::POPF:
 				set_flags(r_m_pop(scratch_uint));
 				break;
-			case 35: // SAHF
+			case OpcodeGroup::SAHF:
 				make_flags();
 				set_flags((scratch_uint & 0xFF00) + regs8[idx(Reg8::AH)]);
 				break;
-			case 36: // LAHF
+			case OpcodeGroup::LAHF:
 				make_flags(),
 				regs8[idx(Reg8::AH)] = scratch_uint;
 				break;
-			case 37: // LES|LDS reg, r/m
+			case OpcodeGroup::LES_LDS_REG_RM:
 				i_w = i_d = 1;
 				decode_rm_reg();
 				OP(=);
 				MEM_OP(REGS_BASE + extra, =, rm_addr + 2);
 				break;
-			case 38: // INT 3
+			case OpcodeGroup::INT_3:
 				++reg_ip;
 				pc_interrupt(3);
 				break;
-			case 39: // INT imm8
+			case OpcodeGroup::INT_IMM8:
 				reg_ip += 2;
 				pc_interrupt(i_data0);
 				break;
-			case 40: // INTO
+			case OpcodeGroup::INTO:
 				++reg_ip;
 				regs8[idx(Flag::OF)] && pc_interrupt(4);
 				break;
-			case 41: // AAM
+			case OpcodeGroup::AAM:
 				if (i_data0 &= 0xFF)
 					regs8[idx(Reg8::AH)] = regs8[idx(Reg8::AL)] / i_data0,
 					op_result = regs8[idx(Reg8::AL)] %= i_data0;
 				else // Divide by zero
 					pc_interrupt(0);
 				break;
-			case 42: // AAD
+			case OpcodeGroup::AAD:
 				i_w = 0;
 				regs16[idx(Reg16::AX)] = op_result = 0xFF & regs8[idx(Reg8::AL)] + i_data0 * regs8[idx(Reg8::AH)];
 				break;
-			case 43: // SALC
+			case OpcodeGroup::SALC:
 				regs8[idx(Reg8::AL)] = -regs8[idx(Flag::CF)];
 				break;
-			case 44: // XLAT
+			case OpcodeGroup::XLAT:
 				regs8[idx(Reg8::AL)] = mem[segreg(seg_override_en ? (u32)seg_override : (u32)idx(Reg16::DS), (u16)(regs16[idx(Reg16::BX)] + regs8[idx(Reg8::AL)]))];
 				break;
-			case 45: // CMC
+			case OpcodeGroup::CMC:
 				regs8[idx(Flag::CF)] ^= 1;
 				break;
-			case 46: // CLC|STC|CLI|STI|CLD|STD
+			case OpcodeGroup::CLC_STC_CLI_STI_CLD_STD:
 				regs8[extra / 2] = extra & 1;
 				break;
-			case 47: // TEST AL/AX, immed
+			case OpcodeGroup::TEST_AL_AX_IMM:
 				R_M_OP(regs8[idx(Reg8::AL)], &, i_data0);
 				break;
-			case 48: // Emulator-specific 0F xx opcodes
-				switch ((char)i_data0)
+			case OpcodeGroup::EMULATOR_SPECIFIC:
+				switch (static_cast<EmulatorOp>((char)i_data0))
 				{
-					case 0: // PUTCHAR_AL
+					case EmulatorOp::PUTCHAR_AL:
 						platform::write_fd(1, regs8, 1);
 						break;
-					case 1: // GET_RTC
+					case EmulatorOp::GET_RTC:
 						time(&clock_buf);
 						ftime(&ms_clock);
 						memcpy(mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]), localtime(&clock_buf), sizeof(struct tm));
 						ref<short>(mem[segreg(idx(Reg16::ES), (u16)(regs16[idx(Reg16::BX)] + 36))]) = ms_clock.millitm;
 						break;
-					case 2: // DISK_READ
-					case 3: // DISK_WRITE
+					case EmulatorOp::DISK_READ:
+					case EmulatorOp::DISK_WRITE:
 					{
 						int fd = disk[regs8[idx(Reg8::DL)]];
 						unsigned int lba_offset = (unsigned int)regs16[idx(Reg16::BP)] << 9;
