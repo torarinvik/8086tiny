@@ -16,6 +16,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <random>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -572,6 +573,18 @@ static const char *g_dump_instr_path = nullptr;
 static const char *g_dump_decisions_path = nullptr;
 static u32 g_max_instructions = 0; // 0 = unlimited
 
+static bool g_track_coverage = false;
+static std::vector<u8> g_global_coverage; // 1MB
+static std::vector<u8> g_run_coverage;    // 1MB
+static std::vector<u32> g_run_touched;
+static u32 g_last_run_gain = 0;
+
+static bool g_explore_mode = false;
+static u32 g_explore_iters = 1000;
+static u32 g_explore_seed = 1;
+static u32 g_explore_max_keys = 64;
+static u32 g_explore_corpus_max = 256;
+
 bool g_scripted_input = false;
 std::vector<u16> g_scripted_keys;
 std::size_t g_scripted_key_pos = 0;
@@ -733,9 +746,36 @@ static inline void record_instruction(u32 phys, const u8 *stream, u32 inst_len) 
 		++info.variant_mismatches;
 }
 
+static inline void record_coverage(u32 phys) noexcept
+{
+	if (!g_track_coverage)
+		return;
+	if (phys >= (u32)PHYS_MEM_SIZE)
+		return;
+	if (!g_run_coverage[phys])
+	{
+		g_run_coverage[phys] = 1;
+		g_run_touched.push_back(phys);
+		if (!g_global_coverage[phys])
+			++g_last_run_gain;
+	}
+}
+
+static inline void finalize_run_coverage() noexcept
+{
+	if (!g_track_coverage)
+		return;
+	for (u32 phys : g_run_touched)
+	{
+		g_run_coverage[phys] = 0;
+		g_global_coverage[phys] = 1;
+	}
+	g_run_touched.clear();
+}
+
 static void dump_instr_map_to_file(const char *path)
 {
-	if (!path || g_instr_map.empty())
+	if (!path)
 		return;
 	std::FILE *f = std::fopen(path, "w");
 	if (!f)
@@ -744,6 +784,11 @@ static void dump_instr_map_to_file(const char *path)
 		return;
 	}
 	std::fprintf(f, "phys20,len,bytes_hex,exec_count,variant_mismatches\n");
+	if (g_instr_map.empty())
+	{
+		std::fclose(f);
+		return;
+	}
 	for (u32 phys = 0; phys < (u32)g_instr_map.size(); ++phys)
 	{
 		const InstrInfo &info = g_instr_map[phys];
@@ -759,7 +804,7 @@ static void dump_instr_map_to_file(const char *path)
 
 static void dump_decisions_to_file(const char *path)
 {
-	if (!path || g_decision_points.empty())
+	if (!path)
 		return;
 	std::FILE *f = std::fopen(path, "w");
 	if (!f)
@@ -768,6 +813,11 @@ static void dump_decisions_to_file(const char *path)
 		return;
 	}
 	std::fprintf(f, "inst_index,cs,ip,phys20,ah\n");
+	if (g_decision_points.empty())
+	{
+		std::fclose(f);
+		return;
+	}
 	for (const DecisionPoint &dp : g_decision_points)
 		std::fprintf(f, "%u,%04X,%04X,%05X,%02X\n",
 			(unsigned)dp.inst_index,
@@ -776,6 +826,109 @@ static void dump_decisions_to_file(const char *path)
 			(unsigned)dp.phys,
 			(unsigned)dp.ah);
 	std::fclose(f);
+}
+
+struct VmSnapshot
+{
+	std::vector<u8> mem_img;
+	std::vector<u8> io_img;
+	u16 reg_ip = 0;
+	u16 seg_override = 0;
+	u16 wave_counter = 0;
+	u8 rep_mode = 0;
+	u8 seg_override_en = 0;
+	u8 rep_override_en = 0;
+	u8 trap_flag = 0;
+	u8 int8_asap = 0;
+	u8 spkr_en = 0;
+	u32 inst_counter = 0;
+};
+
+static VmSnapshot make_snapshot()
+{
+	VmSnapshot s;
+	s.mem_img.assign(mem, mem + RAM_SIZE);
+	s.io_img.assign(io_ports, io_ports + IO_PORT_COUNT);
+	s.reg_ip = reg_ip;
+	s.seg_override = seg_override;
+	s.wave_counter = wave_counter;
+	s.rep_mode = rep_mode;
+	s.seg_override_en = seg_override_en;
+	s.rep_override_en = rep_override_en;
+	s.trap_flag = trap_flag;
+	s.int8_asap = int8_asap;
+	s.spkr_en = spkr_en;
+	s.inst_counter = inst_counter;
+	return s;
+}
+
+static void restore_snapshot(const VmSnapshot &s)
+{
+	std::memcpy(mem, s.mem_img.data(), RAM_SIZE);
+	std::memcpy(io_ports, s.io_img.data(), IO_PORT_COUNT);
+	reg_ip = s.reg_ip;
+	seg_override = s.seg_override;
+	wave_counter = s.wave_counter;
+	rep_mode = s.rep_mode;
+	seg_override_en = s.seg_override_en;
+	rep_override_en = s.rep_override_en;
+	trap_flag = s.trap_flag;
+	int8_asap = s.int8_asap;
+	spkr_en = s.spkr_en;
+	inst_counter = s.inst_counter;
+}
+
+static std::vector<u8> default_explore_alphabet()
+{
+	// Enough to navigate DOS prompt and Gorilla, while hard-banning 'N'.
+	std::vector<u8> a;
+	for (u8 c = '0'; c <= '9'; ++c)
+		a.push_back(c);
+	for (u8 c = 'A'; c <= 'Z'; ++c)
+		if (c != (u8)'N')
+			a.push_back(c);
+	a.push_back((u8)' ');
+	a.push_back(0x0D); // Enter
+	a.push_back(0x08); // Backspace
+	return a;
+}
+
+static std::vector<u16> make_key_words_from_ascii(const std::vector<u8> &ascii)
+{
+	std::vector<u16> out;
+	out.reserve(ascii.size());
+	for (u8 c : ascii)
+		out.push_back((u16)(0x0400u | (u16)c));
+	return out;
+}
+
+static std::vector<u8> mutate_keys(std::mt19937 &rng, const std::vector<u8> &parent, const std::vector<u8> &alphabet, u32 max_len)
+{
+	std::vector<u8> child = parent;
+	std::uniform_int_distribution<int> op_dist(0, 2); // 0=flip,1=insert,2=delete
+	std::uniform_int_distribution<std::size_t> alpha_dist(0, alphabet.size() - 1);
+
+	const int op = op_dist(rng);
+	if (op == 0 && !child.empty())
+	{
+		std::uniform_int_distribution<std::size_t> pos_dist(0, child.size() - 1);
+		child[pos_dist(rng)] = alphabet[alpha_dist(rng)];
+	}
+	else if (op == 1)
+	{
+		if (child.size() < (std::size_t)max_len)
+		{
+			std::uniform_int_distribution<std::size_t> pos_dist(0, child.size());
+			child.insert(child.begin() + (std::ptrdiff_t)pos_dist(rng), alphabet[alpha_dist(rng)]);
+		}
+	}
+	else if (op == 2 && !child.empty())
+	{
+		std::uniform_int_distribution<std::size_t> pos_dist(0, child.size() - 1);
+		child.erase(child.begin() + (std::ptrdiff_t)pos_dist(rng));
+	}
+
+	return child;
 }
 
 static inline void decode_rm_reg()
@@ -1201,6 +1354,51 @@ int main(int argc, char **argv)
 			g_max_instructions = (u32)std::strtoul(arg + 11, nullptr, 10);
 			continue;
 		}
+		if (!std::strcmp(arg, "--explore"))
+		{
+			g_explore_mode = true;
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-iters") && (i + 1) < argc)
+		{
+			g_explore_iters = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-iters=", 15))
+		{
+			g_explore_iters = (u32)std::strtoul(arg + 15, nullptr, 10);
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-seed") && (i + 1) < argc)
+		{
+			g_explore_seed = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-seed=", 15))
+		{
+			g_explore_seed = (u32)std::strtoul(arg + 15, nullptr, 10);
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-max-keys") && (i + 1) < argc)
+		{
+			g_explore_max_keys = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-max-keys=", 19))
+		{
+			g_explore_max_keys = (u32)std::strtoul(arg + 19, nullptr, 10);
+			continue;
+		}
+		if (!std::strcmp(arg, "--explore-corpus") && (i + 1) < argc)
+		{
+			g_explore_corpus_max = (u32)std::strtoul(argv[++i], nullptr, 10);
+			continue;
+		}
+		if (!std::strncmp(arg, "--explore-corpus=", 17))
+		{
+			g_explore_corpus_max = (u32)std::strtoul(arg + 17, nullptr, 10);
+			continue;
+		}
 		if (!std::strcmp(arg, "--keys-file") && (i + 1) < argc)
 		{
 			const char *path = argv[++i];
@@ -1261,10 +1459,21 @@ int main(int argc, char **argv)
 		positional.push_back(arg);
 	}
 
+	if (g_explore_mode)
+	{
+		// Exploration runs are most useful when they persist artifacts by default.
+		if (!g_dump_instr_path)
+			g_dump_instr_path = "instr.csv";
+		if (!g_dump_decisions_path)
+			g_dump_decisions_path = "decisions.csv";
+	}
+
 	if (positional.size() < 2)
 	{
 		std::fprintf(stderr,
-			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...] bios fd.img [hd.img]\n",
+			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
+			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N]\n"
+			"          bios fd.img [hd.img]\n",
 			argv[0]);
 		return 1;
 	}
@@ -1273,7 +1482,7 @@ int main(int argc, char **argv)
 	const char *fd_path = positional[1];
 	const char *hd_path = (positional.size() >= 3) ? positional[2] : nullptr;
 
-	if (g_dump_instr_path)
+	if (g_dump_instr_path || g_explore_mode)
 		g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
 
 	// regs16 and reg8 point to F000:0, the start of memory-mapped registers. CS is initialised to F000
@@ -1320,6 +1529,51 @@ int main(int argc, char **argv)
 	for (int i = 0; i < 20; i++)
 		for (int j = 0; j < 256; j++)
 			bios_table_lookup[i][j] = regs8[regs16[0x81 + i] + j];
+
+	// Exploration mode: run many trials in-process for speed.
+	VmSnapshot base_snapshot;
+	std::mt19937 explore_rng;
+	std::vector<std::vector<u8>> explore_corpus;
+	std::vector<u8> explore_alphabet;
+	std::vector<u8> explore_current;
+	u32 explore_iter = 0;
+	u32 explore_best_gain = 0;
+	std::vector<u8> explore_best_seq;
+
+	if (g_explore_mode)
+	{
+		g_track_coverage = true;
+		g_global_coverage.assign(PHYS_MEM_SIZE, 0);
+		g_run_coverage.assign(PHYS_MEM_SIZE, 0);
+		g_run_touched.clear();
+		g_run_touched.reserve(4096);
+
+		explore_rng.seed(g_explore_seed);
+		explore_alphabet = default_explore_alphabet();
+
+		// Seed: try to launch Gorilla from the DOS prompt.
+		explore_corpus.push_back(std::vector<u8>{'G','O','R','I','L','L','A',0x0D});
+
+		// If the user provided --keys/--keys-file, treat it as an additional seed.
+		if (g_scripted_input && !g_scripted_keys.empty())
+		{
+			std::vector<u8> seed_ascii;
+			seed_ascii.reserve(g_scripted_keys.size());
+			for (u16 kw : g_scripted_keys)
+				seed_ascii.push_back((u8)(kw & 0xFF));
+			explore_corpus.push_back(std::move(seed_ascii));
+		}
+
+		base_snapshot = make_snapshot();
+
+		explore_current = explore_corpus.front();
+		g_scripted_input = true;
+		g_scripted_keys = make_key_words_from_ascii(explore_current);
+		g_scripted_key_pos = 0;
+		g_last_run_gain = 0;
+	}
+
+	run_loop:
 
 	// Instruction execution loop. Terminates if CS:IP = 0:0
 	for (; opcode_stream = mem + 16 * regs16[idx(Reg16::CS)] + reg_ip, opcode_stream != mem;)
@@ -1396,6 +1650,7 @@ int main(int argc, char **argv)
 		}
 
 		const u32 inst_len = compute_inst_len();
+		record_coverage(inst_phys);
 		record_instruction(inst_phys, opcode_stream, inst_len);
 
 		// Instruction execution unit
@@ -1782,7 +2037,10 @@ int main(int argc, char **argv)
 				{
 					const u8 ah = regs8[idx(Reg8::AH)];
 					if (ah == 0x00 || ah == 0x01)
-						g_decision_points.push_back(DecisionPoint{cur_inst, inst_cs, inst_ip, inst_phys, ah});
+					{
+						if (g_dump_decisions_path || g_decision_points.size() < 100000u)
+							g_decision_points.push_back(DecisionPoint{cur_inst, inst_cs, inst_ip, inst_phys, ah});
+					}
 
 					// Scripted input mode: emulate INT 16h directly for speed and determinism.
 					// Returns ASCII in AL, sets ZF for AH=01h, and avoids BIOS INT 7h buffer logic.
@@ -2017,6 +2275,54 @@ int main(int argc, char **argv)
 		// then process the tick and check for new keystrokes
 		if (int8_asap && !seg_override_en && !rep_override_en && regs8[idx(Flag::IF)] && !regs8[idx(Flag::TF)])
 			pc_interrupt(0xA), int8_asap = 0, poll_active_keyboard();
+	}
+
+	if (g_explore_mode)
+	{
+		const u32 gain = g_last_run_gain;
+		finalize_run_coverage();
+
+		if (gain > explore_best_gain)
+		{
+			explore_best_gain = gain;
+			explore_best_seq = explore_current;
+		}
+
+		if (gain > 0)
+		{
+			if (explore_corpus.size() < (std::size_t)g_explore_corpus_max)
+				explore_corpus.push_back(explore_current);
+			else
+				explore_corpus[(std::size_t)(explore_rng() % explore_corpus.size())] = explore_current;
+		}
+
+		if ((explore_iter % 100u) == 0u)
+			std::fprintf(stderr, "EXPLORE iter=%u corpus=%u last_gain=%u best_gain=%u\n",
+				(unsigned)explore_iter,
+				(unsigned)explore_corpus.size(),
+				(unsigned)gain,
+				(unsigned)explore_best_gain);
+
+		++explore_iter;
+		if (explore_iter < g_explore_iters)
+		{
+			restore_snapshot(base_snapshot);
+			g_last_run_gain = 0;
+
+			std::uniform_int_distribution<std::size_t> pick_parent(0, explore_corpus.size() - 1);
+			const std::vector<u8> &parent = explore_corpus[pick_parent(explore_rng)];
+			explore_current = mutate_keys(explore_rng, parent, explore_alphabet, g_explore_max_keys);
+
+			g_scripted_input = true;
+			g_scripted_keys = make_key_words_from_ascii(explore_current);
+			g_scripted_key_pos = 0;
+			goto run_loop;
+		}
+
+		std::fprintf(stderr, "EXPLORE done: iters=%u corpus=%u best_gain=%u\n",
+			(unsigned)explore_iter,
+			(unsigned)explore_corpus.size(),
+			(unsigned)explore_best_gain);
 	}
 
 	dump_instr_map_to_file(g_dump_instr_path);
