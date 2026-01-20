@@ -17,6 +17,8 @@
 #include <sstream>
 #include <algorithm>
 #include <random>
+#include <csignal>
+#include <cerrno>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -596,6 +598,13 @@ static u32 g_explore_warmup_inst = 2000000; // initial warmup budget; may auto-e
 static bool g_explore_warmup_inst_user_set = false;
 static std::string g_explore_tty_tail;
 
+static volatile std::sig_atomic_t g_host_stop_signal = 0;
+
+static void on_host_signal(int sig)
+{
+	g_host_stop_signal = sig;
+}
+
 bool g_scripted_input = false;
 std::vector<u16> g_scripted_keys;
 std::size_t g_scripted_key_pos = 0;
@@ -808,6 +817,8 @@ static inline void record_coverage(u32 phys) noexcept
 {
 	if (!g_track_coverage)
 		return;
+	if (g_run_coverage.size() != PHYS_MEM_SIZE || g_global_coverage.size() != PHYS_MEM_SIZE)
+		return;
 	if (phys >= (u32)PHYS_MEM_SIZE)
 		return;
 	if (!g_run_coverage[phys])
@@ -822,6 +833,8 @@ static inline void record_coverage(u32 phys) noexcept
 static inline void finalize_run_coverage() noexcept
 {
 	if (!g_track_coverage)
+		return;
+	if (g_run_coverage.size() != PHYS_MEM_SIZE || g_global_coverage.size() != PHYS_MEM_SIZE)
 		return;
 	for (u32 phys : g_run_touched)
 	{
@@ -922,6 +935,11 @@ static VmSnapshot make_snapshot()
 
 static void restore_snapshot(const VmSnapshot &s)
 {
+	if (s.mem_img.size() != RAM_SIZE || s.io_img.size() != IO_PORT_COUNT)
+	{
+		std::fprintf(stderr, "restore_snapshot: invalid snapshot sizes (mem=%zu io=%zu)\n", s.mem_img.size(), s.io_img.size());
+		return;
+	}
 	std::memcpy(mem, s.mem_img.data(), RAM_SIZE);
 	std::memcpy(io_ports, s.io_img.data(), IO_PORT_COUNT);
 	reg_ip = s.reg_ip;
@@ -966,6 +984,8 @@ static std::vector<u16> make_key_words_from_ascii(const std::vector<u8> &ascii)
 
 static std::vector<u8> mutate_keys(std::mt19937 &rng, const std::vector<u8> &parent, const std::vector<u8> &alphabet, u32 max_len)
 {
+	if (alphabet.empty())
+		return parent;
 	std::vector<u8> child = parent;
 	std::uniform_int_distribution<int> op_dist(0, 2); // 0=flip,1=insert,2=delete
 	std::uniform_int_distribution<std::size_t> alpha_dist(0, alphabet.size() - 1);
@@ -1403,6 +1423,14 @@ int main(int argc, char **argv)
 	sdl_texture.reset();
 #endif
 
+	// Graceful termination for long headless runs.
+	std::signal(SIGINT, on_host_signal);
+	std::signal(SIGTERM, on_host_signal);
+	std::signal(SIGQUIT, on_host_signal);
+#ifdef SIGTSTP
+	std::signal(SIGTSTP, on_host_signal);
+#endif
+
 	std::vector<const char *> positional;
 	positional.reserve((std::size_t)argc);
 	for (int i = 1; i < argc; ++i)
@@ -1736,6 +1764,8 @@ int main(int argc, char **argv)
 	// Instruction execution loop. Terminates if CS:IP = 0:0
 	for (; opcode_stream = mem + 16 * regs16[idx(Reg16::CS)] + reg_ip, opcode_stream != mem;)
 	{
+		if (g_host_stop_signal)
+			break;
 		const u32 cur_inst = inst_counter + 1u;
 		const u16 inst_cs = regs16[idx(Reg16::CS)];
 		const u16 inst_ip = reg_ip;
@@ -2407,6 +2437,14 @@ int main(int argc, char **argv)
 			break;
 		}
 
+
+	if (g_host_stop_signal)
+	{
+		std::fprintf(stderr, "Stopping due to signal %d; dumping outputs...\n", (int)g_host_stop_signal);
+		if (g_explore_mode)
+			finalize_run_coverage();
+		g_explore_mode = false;
+	}
 #if SNAP_AT
 		if (inst_counter == (u32)SNAP_AT)
 		{
