@@ -591,6 +591,7 @@ static bool g_debug_diskio = false;
 static u32 g_debug_diskio_left = 0;
 static bool g_explore_warmup_active = false;
 static bool g_explore_stop_requested = false;
+static bool g_explore_prompt_seen = false;
 static u32 g_explore_warmup_inst = 2000000; // run this many instructions to reach DOS prompt before snapshotting
 static std::string g_explore_tty_tail;
 
@@ -689,7 +690,10 @@ static inline void explore_observe_tty_char(u8 ch)
 		const std::size_t start = (n > 64u) ? (n - 64u) : 0u;
 		const std::string_view tail(g_explore_tty_tail.data() + start, n - start);
 		if (tail.find(":\\") != std::string_view::npos)
+		{
+			g_explore_prompt_seen = true;
 			g_explore_stop_requested = true;
+		}
 	}
 }
 
@@ -999,6 +1003,30 @@ static inline void decode_rm_reg()
 		op_from_addr = rm_addr;
 		op_to_addr = scratch_uint;
 	}
+}
+
+static bool parse_u32_flag(const char *flag, const char *value, u32 &out)
+{
+	if (!value || !*value)
+	{
+		std::fprintf(stderr, "Missing value for %s\n", flag);
+		return false;
+	}
+	char *end = nullptr;
+	errno = 0;
+	const unsigned long v = std::strtoul(value, &end, 10);
+	if (errno != 0 || end == value || (end && *end != '\0'))
+	{
+		std::fprintf(stderr, "Invalid value for %s: %s\n", flag, value);
+		return false;
+	}
+	if (v > 0xFFFFFFFFul)
+	{
+		std::fprintf(stderr, "Out-of-range value for %s: %s\n", flag, value);
+		return false;
+	}
+	out = (u32)v;
+	return true;
 }
 
 static inline u32 get_reg_addr(u32 reg_id) noexcept
@@ -1386,12 +1414,14 @@ int main(int argc, char **argv)
 		}
 		if (!std::strcmp(arg, "--max-inst") && (i + 1) < argc)
 		{
-			g_max_instructions = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--max-inst", argv[++i], g_max_instructions))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--max-inst=", 11))
 		{
-			g_max_instructions = (u32)std::strtoul(arg + 11, nullptr, 10);
+			if (!parse_u32_flag("--max-inst", arg + 11, g_max_instructions))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--explore"))
@@ -1419,52 +1449,62 @@ int main(int argc, char **argv)
 		}
 		if (!std::strcmp(arg, "--explore-iters") && (i + 1) < argc)
 		{
-			g_explore_iters = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--explore-iters", argv[++i], g_explore_iters))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-iters=", 15))
 		{
-			g_explore_iters = (u32)std::strtoul(arg + 15, nullptr, 10);
+			if (!parse_u32_flag("--explore-iters", arg + 15, g_explore_iters))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--explore-seed") && (i + 1) < argc)
 		{
-			g_explore_seed = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--explore-seed", argv[++i], g_explore_seed))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-seed=", 15))
 		{
-			g_explore_seed = (u32)std::strtoul(arg + 15, nullptr, 10);
+			if (!parse_u32_flag("--explore-seed", arg + 15, g_explore_seed))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--explore-max-keys") && (i + 1) < argc)
 		{
-			g_explore_max_keys = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--explore-max-keys", argv[++i], g_explore_max_keys))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-max-keys=", 19))
 		{
-			g_explore_max_keys = (u32)std::strtoul(arg + 19, nullptr, 10);
+			if (!parse_u32_flag("--explore-max-keys", arg + 19, g_explore_max_keys))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--explore-corpus") && (i + 1) < argc)
 		{
-			g_explore_corpus_max = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--explore-corpus", argv[++i], g_explore_corpus_max))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-corpus=", 17))
 		{
-			g_explore_corpus_max = (u32)std::strtoul(arg + 17, nullptr, 10);
+			if (!parse_u32_flag("--explore-corpus", arg + 17, g_explore_corpus_max))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--explore-warmup-inst") && (i + 1) < argc)
 		{
-			g_explore_warmup_inst = (u32)std::strtoul(argv[++i], nullptr, 10);
+			if (!parse_u32_flag("--explore-warmup-inst", argv[++i], g_explore_warmup_inst))
+				return 2;
 			continue;
 		}
 		if (!std::strncmp(arg, "--explore-warmup-inst=", 22))
 		{
-			g_explore_warmup_inst = (u32)std::strtoul(arg + 22, nullptr, 10);
+			if (!parse_u32_flag("--explore-warmup-inst", arg + 22, g_explore_warmup_inst))
+				return 2;
 			continue;
 		}
 		if (!std::strcmp(arg, "--keys-file") && (i + 1) < argc)
@@ -1587,9 +1627,29 @@ int main(int argc, char **argv)
 				continue;
 			}
 			const int fd = platform::open_disk_image(path);
-			disk[target_index] = (fd < 0) ? 0 : fd;
+			if (fd < 0)
+			{
+				std::perror(path);
+				disk[target_index] = 0;
+				continue;
+			}
+			disk[target_index] = fd;
 		}
 	}
+
+	// BIOS and floppy are required to boot.
+	if (disk[2] <= 0)
+	{
+		std::fprintf(stderr, "Failed to open BIOS image: %s\n", bios_path);
+		return 2;
+	}
+	if (disk[1] <= 0)
+	{
+		std::fprintf(stderr, "Failed to open floppy image: %s\n", fd_path);
+		return 2;
+	}
+	if (hd_path && disk[0] <= 0)
+		std::fprintf(stderr, "Warning: hard disk image not opened: %s\n", hd_path);
 
 	// Set CX:AX equal to the hard disk image size, if present
 	const std::int64_t disk_size_bytes = *disk ? platform::seek_end_bytes(*disk) : -1;
@@ -1639,6 +1699,7 @@ int main(int argc, char **argv)
 			g_max_instructions = g_explore_warmup_inst;
 
 		g_explore_warmup_active = true;
+		g_explore_prompt_seen = false;
 		g_explore_tty_tail.clear();
 		g_last_run_gain = 0;
 
@@ -2231,6 +2292,17 @@ int main(int argc, char **argv)
 						u8 *buf = mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]);
 						const bool is_write = ((char)i_data0 == 3);
 
+						if (byte_count > RAM_SIZE)
+						{
+							regs16[idx(Reg16::AX)] = 0;
+							break;
+						}
+						if ((buf < mem) || (buf + byte_count > mem + RAM_SIZE))
+						{
+							regs16[idx(Reg16::AX)] = 0;
+							break;
+						}
+
 						// Match original C semantics:
 						// - offset uses a 32-bit sector index sourced from SI:BP
 						// - seek failure returns AL=0
@@ -2250,6 +2322,13 @@ int main(int argc, char **argv)
 						}
 						if (fd <= 0)
 						{
+							if (g_debug_diskio && g_debug_diskio_left)
+							{
+								--g_debug_diskio_left;
+								std::fprintf(stderr, "DISK_%s attempted on missing drive: dl=%u\n",
+									is_write ? "WRITE" : "READ",
+									(unsigned)dl);
+							}
 							regs16[idx(Reg16::AX)] = 0;
 							break;
 						}
@@ -2395,6 +2474,8 @@ int main(int argc, char **argv)
 			// Warmup just ended: snapshot state (ideally at DOS prompt), then reset instrumentation
 			// so exploration measures only from the prompt onward.
 			g_explore_warmup_active = false;
+			if (!g_explore_prompt_seen)
+				std::fprintf(stderr, "Warning: explore warmup ended without detecting a DOS prompt; increase --explore-warmup-inst or run with --loud to inspect boot output.\n");
 			g_explore_tty_tail.clear();
 			base_snapshot = make_snapshot();
 
