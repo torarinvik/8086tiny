@@ -587,6 +587,8 @@ static u32 g_explore_corpus_max = 256;
 
 static bool g_quiet_output = false;
 static bool g_quiet_output_user_set = false;
+static bool g_debug_diskio = false;
+static u32 g_debug_diskio_left = 0;
 static bool g_explore_warmup_active = false;
 static bool g_explore_stop_requested = false;
 static u32 g_explore_warmup_inst = 2000000; // run this many instructions to reach DOS prompt before snapshotting
@@ -638,9 +640,14 @@ static bool try_parse_gorilla_ascii_token(const std::string &token, u8 &out_asci
 			out_ascii = (u8)c;
 			return true;
 		}
-		if (c == 'Y')
+		if (c >= 'A' && c <= 'Z' && c != 'N')
 		{
-			out_ascii = (u8)'Y';
+			out_ascii = (u8)c;
+			return true;
+		}
+		if (c == ':' || c == '\\' || c == '.' || c == '_')
+		{
+			out_ascii = (u8)c;
 			return true;
 		}
 		return false;
@@ -915,6 +922,10 @@ static std::vector<u8> default_explore_alphabet()
 	for (u8 c = 'A'; c <= 'Z'; ++c)
 		if (c != (u8)'N')
 			a.push_back(c);
+	a.push_back((u8)':');
+	a.push_back((u8)'\\');
+	a.push_back((u8)'.');
+	a.push_back((u8)'_');
 	a.push_back((u8)' ');
 	a.push_back(0x0D); // Enter
 	a.push_back(0x08); // Backspace
@@ -1090,7 +1101,8 @@ static inline u32 segreg(u32 seg_reg, u16 offset) noexcept
 static inline u32 r_m_push(u32 value) noexcept
 {
 	i_w = 1;
-	R_M_OP(mem[segreg(idx(Reg16::SS), (u16)--regs16[idx(Reg16::SP)])], =, value);
+	regs16[idx(Reg16::SP)] = (u16)(regs16[idx(Reg16::SP)] - 2);
+	R_M_OP(mem[segreg(idx(Reg16::SS), (u16)regs16[idx(Reg16::SP)])], =, value);
 	return (u32)op_result;
 }
 
@@ -1399,6 +1411,12 @@ int main(int argc, char **argv)
 			g_quiet_output_user_set = true;
 			continue;
 		}
+		if (!std::strcmp(arg, "--debug-diskio"))
+		{
+			g_debug_diskio = true;
+			g_debug_diskio_left = 200;
+			continue;
+		}
 		if (!std::strcmp(arg, "--explore-iters") && (i + 1) < argc)
 		{
 			g_explore_iters = (u32)std::strtoul(argv[++i], nullptr, 10);
@@ -1526,6 +1544,7 @@ int main(int argc, char **argv)
 		std::fprintf(stderr,
 			"Usage: %s [--max-inst N] [--dump-instr path.csv] [--dump-decisions path.csv] [--keys-file keys.txt | --keys tok,tok,...]\n"
 			"          [--quiet|--loud]\n"
+			"          [--debug-diskio]\n"
 			"          [--explore --explore-iters N --explore-seed N --explore-max-keys N --explore-corpus N --explore-warmup-inst N]\n"
 			"          bios fd.img [hd.img]\n",
 			argv[0]);
@@ -2121,16 +2140,13 @@ int main(int argc, char **argv)
 						// AH=00h: read key; if no key left, end run (avoid blocking forever).
 						if (!scripted_input_has_key())
 						{
-							if (g_explore_mode && g_explore_warmup_active)
+							if (g_explore_mode)
 							{
-								// Warmup: stop so we can snapshot at the prompt instead of terminating the VM.
+								// Exploration: stop the host run without mutating guest state.
 								g_explore_stop_requested = true;
-								regs8[idx(Reg8::AL)] = 0;
-								regs8[idx(Reg8::AH)] = 0;
-								reg_ip += 2;
 								break;
 							}
-							// Explore iterations: end run (avoid blocking forever).
+							// Non-explore scripted mode: end run (avoid blocking forever).
 							regs16[idx(Reg16::CS)] = 0;
 							reg_ip = 0;
 							break;
@@ -2209,7 +2225,8 @@ int main(int argc, char **argv)
 					case EmulatorOp::DISK_READ:
 					case EmulatorOp::DISK_WRITE:
 					{
-						const int fd = disk[regs8[idx(Reg8::DL)]];
+						const u8 dl = regs8[idx(Reg8::DL)];
+						const int fd = (dl & 0x80u) ? disk[0] : disk[1];
 						const unsigned int byte_count = regs16[idx(Reg16::AX)];
 						u8 *buf = mem + segreg(idx(Reg16::ES), (u16)regs16[idx(Reg16::BX)]);
 						const bool is_write = ((char)i_data0 == 3);
@@ -2220,17 +2237,33 @@ int main(int argc, char **argv)
 						// - read/write failure returns AL=0xFF (via u8 cast of -1)
 						const u32 lba = ref<u32>(regs8[2u * idx(Reg16::BP)]);
 						const std::uint64_t byte_offset = (std::uint64_t)lba << 9;
+						if (g_debug_diskio && g_debug_diskio_left)
+						{
+							--g_debug_diskio_left;
+							std::fprintf(stderr, "DISK_%s dl=%u fd=%d lba=%u off=%llu bytes=%u\n",
+								is_write ? "WRITE" : "READ",
+								(unsigned)regs8[idx(Reg8::DL)],
+								fd,
+								(unsigned)lba,
+								(unsigned long long)byte_offset,
+								(unsigned)byte_count);
+						}
+						if (fd <= 0)
+						{
+							regs16[idx(Reg16::AX)] = 0;
+							break;
+						}
 						const std::int64_t pos = platform::seek_set_bytes(fd, byte_offset);
 						if (pos == (std::int64_t)-1)
 						{
-							regs8[idx(Reg8::AL)] = 0;
+							regs16[idx(Reg16::AX)] = 0;
 						}
 						else
 						{
 							const std::int64_t rv = is_write
 								? platform::write_fd(fd, buf, (std::size_t)byte_count)
 								: platform::read_fd(fd, buf, (std::size_t)byte_count);
-							regs8[idx(Reg8::AL)] = (u8)rv;
+							regs16[idx(Reg16::AX)] = (rv > 0) ? (u16)rv : 0;
 						}
 					}
 						break;
@@ -2374,7 +2407,7 @@ int main(int argc, char **argv)
 				g_instr_map.assign(PHYS_MEM_SIZE, InstrInfo{});
 
 			explore_corpus.clear();
-			// Seed: try to launch Gorilla from the DOS prompt.
+			// Seed: launch Gorilla from the boot floppy (A:).
 			explore_corpus.push_back(std::vector<u8>{'G','O','R','I','L','L','A',0x0D});
 			if (!explore_user_seed_ascii.empty())
 				explore_corpus.push_back(explore_user_seed_ascii);

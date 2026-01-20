@@ -37,3 +37,6 @@ VERIFY_YOUR_REASONING.py
 8086tiny_cpp
 *.csv
 .~lock.decisions.csv\#
+hd.img
+fd.img
+fd.img
